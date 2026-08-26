@@ -1,0 +1,35 @@
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+.venv/
+**/.venv/
+
+# Language and tool caches
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+
+# Generated build outputs
+build/
+dist/
+*.tmp
+
+# Reproducible local data and model outputs
+development/data/raw/
+development/data/interim/
+development/data/processed/
+development/artifacts/
+development/notebooks/.ipynb_checkpoints/
+development/submit.zip

@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "status": "provisional_from_provided_docs",
+  "functions": [
+    "predict_stage1",
+    "predict_stage2",
+    "predict_stage3"
+  ],
+  "stages": {
+    "stage1": {
+      "columns": ["ID", "answer"],
+      "allowed_values": {
+        "answer": ["ORIGINAL", "RERECORDED"]
+      }
+    },
+    "stage2": {
+      "columns": ["ID", "collision_frame", "entry_frame", "evasion_space", "entry_side"],
+      "allowed_values": {
+        "evasion_space": [0, 1],
+        "entry_side": ["LEFT", "RIGHT"]
+      },
+      "notes": [
+        "collision_frame and entry_frame must use original frame numbers from evaluation image filenames",
+        "evasion_space encoding is provisional and derived from the supplied baseline"
+      ]
+    },
+    "stage3": {
+      "columns": ["ID", "sample_index", "accel_label", "steer_label"],
+      "allowed_values": {
+        "accel_label": ["ACCELERATING", "DECELERATING", "CONSTANT", "STOPPED"],
+        "steer_label": ["LEFT", "STRAIGHT", "RIGHT"]
+      },
+      "notes": [
+        "sample_index represents a 0.1 second sample sequence"
+      ]
+    }
+  },
+  "submission": {
+    "required_files": [
+      "inference.py",
+      "requirements.txt",
+      "model/stage1/best.pt",
+      "model/stage2/best.pt",
+      "model/stage2/resnet18-f37072fd.pth",
+      "model/stage3/best.pt"
+    ],
+    "max_zip_bytes": 10737418240,
+    "max_uncompressed_bytes": 34359738368,
+    "max_inference_seconds": 3600,
+    "max_install_seconds": 600,
+    "network_enabled": false
+  }
+}

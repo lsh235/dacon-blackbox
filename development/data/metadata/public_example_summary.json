@@ -1,0 +1,29 @@
+{
+  "root": "/home/sra235/2026/dacon/blackbox/development/data/raw/public_example",
+  "video_count": 20,
+  "total_bytes": 195351697,
+  "decodable_count": 20,
+  "undecodable_count": 0,
+  "duplicate_content_groups": [
+    [
+      "stage1/original/000001.mp4",
+      "stage2/videos/000001.mp4"
+    ],
+    [
+      "stage1/original/000002.mp4",
+      "stage2/videos/000002.mp4"
+    ],
+    [
+      "stage1/original/000003.mp4",
+      "stage2/videos/000003.mp4"
+    ],
+    [
+      "stage1/original/000004.mp4",
+      "stage2/videos/000004.mp4"
+    ],
+    [
+      "stage1/original/000005.mp4",
+      "stage2/videos/000005.mp4"
+    ]
+  ]
+}

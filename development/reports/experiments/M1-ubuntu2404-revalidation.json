@@ -1,0 +1,67 @@
+{
+  "created_at_utc": "2026-08-26T15:28:14.623440+00:00",
+  "git_commit": null,
+  "command": "Ubuntu 24.04 Python 3.12 PyTorch 2.8 one-epoch training and integrated smoke",
+  "note": "Structural compatibility only; no accuracy or L40S performance claim.",
+  "environment": {
+    "python": "3.12.3",
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.39",
+    "torch": "2.8.0+cu128",
+    "torchvision": "0.23.0+cu128",
+    "cuda_available": true,
+    "cuda_version": "12.8",
+    "gpu": "NVIDIA GeForce RTX 4060"
+  },
+  "artifacts": [
+    {
+      "path": "requirements.txt",
+      "bytes": 99,
+      "sha256": "dcf78682237f0185434bed59fc3fbf1563e9b1998f7111214a2e7f7f8de5cd54"
+    },
+    {
+      "path": "reports/experiments/ubuntu2404-environment.json",
+      "bytes": 719,
+      "sha256": "fd4d2eeea5b318ffa00d469b9e392eafc58e722b4ec2ecc1eb8e027442525fae"
+    },
+    {
+      "path": "artifacts/checkpoints/ubuntu2404-epoch1/stage1/best.pt",
+      "bytes": 137046252,
+      "sha256": "eff62b39de8234bf1b5d2c87eb48e3eb643956e22e9d1851f14b07d185b754a7"
+    },
+    {
+      "path": "artifacts/checkpoints/ubuntu2404-epoch1/stage2/best.pt",
+      "bytes": 6518300,
+      "sha256": "d98d1ec7f5f9e193fdb722d9551323ec896e7083596e0de291e46baaa1339032"
+    },
+    {
+      "path": "artifacts/checkpoints/ubuntu2404-epoch1/stage2/resnet18-f37072fd.pth",
+      "bytes": 46836811,
+      "sha256": "65100482c5149508cd03f83904f8da687b89ff8e759591fcefccbd5ba136c7df"
+    },
+    {
+      "path": "artifacts/checkpoints/ubuntu2404-epoch1/stage3/best.pt",
+      "bytes": 137069602,
+      "sha256": "465880b7052103c7efbd033ed812220e73084942fb69e5bab5eca701fdf7f1c5"
+    },
+    {
+      "path": "artifacts/predictions/ubuntu2404-epoch1-integrated-smoke/stage1_predictions.csv",
+      "bytes": 31,
+      "sha256": "7ea13028c7077c045dce3506bd2c0e307f4151c2b7ce6e7467139dffded6ec0e"
+    },
+    {
+      "path": "artifacts/predictions/ubuntu2404-epoch1-integrated-smoke/stage2_predictions.csv",
+      "bytes": 77,
+      "sha256": "a5c519b78b146f75740909c71bd3973fd0abf31be90858ee1447366a92646271"
+    },
+    {
+      "path": "artifacts/predictions/ubuntu2404-epoch1-integrated-smoke/stage3_predictions.csv",
+      "bytes": 307,
+      "sha256": "503d5311000851bbf0d042ad49c4e6b707ca5d9ed26a1e88437de0ef3ad66b99"
+    },
+    {
+      "path": "artifacts/predictions/ubuntu2404-epoch1-integrated-smoke/timings.json",
+      "bytes": 82,
+      "sha256": "0c8dbb75c073c5a2a0ada424d67b701a26008d0bbd4f1090c2ee504c691ffd32"
+    }
+  ]
+}

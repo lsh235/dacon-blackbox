@@ -1,0 +1,62 @@
+{
+  "created_at_utc": "2026-08-26T13:57:18.624146+00:00",
+  "git_commit": null,
+  "command": "0-epoch structural smoke on isolated public example",
+  "note": "No accuracy claim; current environment differs from supplied requirements.",
+  "environment": {
+    "python": "3.10.12",
+    "platform": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.35",
+    "torch": "2.4.0+cu121",
+    "torchvision": "0.19.0+cu121",
+    "cuda_available": true,
+    "cuda_version": "12.1",
+    "gpu": "NVIDIA GeForce RTX 4060"
+  },
+  "artifacts": [
+    {
+      "path": "configs/submission_contract.json",
+      "bytes": 1505,
+      "sha256": "ea8f521037e739c2e6e73de7de63bd520f202b50f1abc6a4af4778d76f804299"
+    },
+    {
+      "path": "artifacts/checkpoints/baseline-structure/stage1/best.pt",
+      "bytes": 137045861,
+      "sha256": "c608d91307f9775ac1de935fa6292a73ffd2c7ad682f9d5a5e3098345761a708"
+    },
+    {
+      "path": "artifacts/checkpoints/baseline-structure/stage2/best.pt",
+      "bytes": 6517909,
+      "sha256": "f9cc0f4dab7944b3721829a4d7483427e21c82de358c936c9a39e3453b03d441"
+    },
+    {
+      "path": "artifacts/checkpoints/baseline-structure/stage2/resnet18-f37072fd.pth",
+      "bytes": 46836394,
+      "sha256": "7c453af2dd17b0c4d031ae826f2202e5085b462502a9c8239aac88546eaed2d8"
+    },
+    {
+      "path": "artifacts/checkpoints/baseline-structure/stage3/best.pt",
+      "bytes": 137069211,
+      "sha256": "bce719ef353ae62a8276459e27be33a3f2eb64f995c9f520b12c738f58234ee7"
+    },
+    {
+      "path": "artifacts/predictions/baseline-structure-smoke-rerun/stage1_predictions.csv",
+      "bytes": 33,
+      "sha256": "f5bd6f6116d34979626a818a2ae7e0df386819b23860bb48b6c4e5652c6da5c3"
+    },
+    {
+      "path": "artifacts/predictions/baseline-structure-smoke-rerun/stage2_predictions.csv",
+      "bytes": 78,
+      "sha256": "c4fa7e8ed3307fcf30caa86329305d00c6e80ebc46d2d6b52abfe0c512abb8b0"
+    },
+    {
+      "path": "artifacts/predictions/baseline-structure-smoke-rerun/stage3_predictions.csv",
+      "bytes": 283,
+      "sha256": "03edbb9b56d5bb69760aa363c80656e1e340fe93e72d50acd7f117f831c67383"
+    },
+    {
+      "path": "artifacts/predictions/baseline-structure-smoke-rerun/timings.json",
+      "bytes": 84,
+      "sha256": "6a20582d7c45cd950d443465c85c1a2a29c915010b95bd8705425f4dc560deca"
+    }
+  ]
+}

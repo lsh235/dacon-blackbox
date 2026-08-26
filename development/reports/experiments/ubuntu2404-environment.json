@@ -1,0 +1,37 @@
+{
+  "ok": true,
+  "os": {
+    "name": "Ubuntu 24.04.4 LTS",
+    "version_id": "24.04",
+    "kernel": "6.18.33.2-microsoft-standard-WSL2",
+    "libc": "2.39"
+  },
+  "python": "3.12.3",
+  "requirements": {
+    "torch": "2.8.0",
+    "torchvision": "0.23.0",
+    "numpy": "1.26.4",
+    "pandas": "2.2.2",
+    "opencv-python": "4.10.0.84",
+    "tqdm": "4.66.5"
+  },
+  "installed": {
+    "torch": "2.8.0",
+    "torchvision": "0.23.0",
+    "numpy": "1.26.4",
+    "pandas": "2.2.2",
+    "opencv-python": "4.10.0.84",
+    "tqdm": "4.66.5"
+  },
+  "cuda": {
+    "available": true,
+    "runtime": "12.8",
+    "cudnn": 91002,
+    "device": "NVIDIA GeForce RTX 4060",
+    "capability": [
+      8,
+      9
+    ]
+  },
+  "errors": []
+}

@@ -1,0 +1,22 @@
+# Local datasets and generated artifacts
+data/raw/
+data/interim/
+data/processed/
+artifacts/
+
+# Notebook and Python caches
+notebooks/.ipynb_checkpoints/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and secrets
+.venv/
+.env
+.env.*
+
+# Temporary submission files
+submit.zip
+*.tmp
