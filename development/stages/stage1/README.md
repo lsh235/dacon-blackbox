@@ -3,6 +3,7 @@
 입력 영상을 `ORIGINAL` 또는 `RERECORDED`로 분류한다.
 
 - 먼저 읽을 문서: [`STUDY_AND_IMPROVEMENT_GUIDE.md`](./STUDY_AND_IMPROVEMENT_GUIDE.md)
+- 개선 과정 학습 노트: [`ITERATION_0_1_LEARNING.md`](./ITERATION_0_1_LEARNING.md)
 - 현재 구현: [`../../src/blackbox/stages/stage1/baseline.py`](../../src/blackbox/stages/stage1/baseline.py)
 - 공통 전처리: [`../../src/blackbox/common/runtime.py`](../../src/blackbox/common/runtime.py)
 - 작업 상태: [`../../TASKS.md`](../../TASKS.md)의 M3
