@@ -17,9 +17,23 @@ def main() -> int:
     parser.add_argument("--stages", type=int, nargs="+", choices=[1, 2, 3], default=[1, 2, 3])
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--pretrained-stage2", action="store_true")
+    parser.add_argument(
+        "--stage1-feature-mode",
+        choices=("rgb", "rgb_fft"),
+        default="rgb_fft",
+        help="Use RGB alone or concatenate per-channel 2-D FFT log spectra.",
+    )
+    parser.add_argument(
+        "--stage1-focal-gamma",
+        type=float,
+        default=2.0,
+        help="Focal modulation strength; 0 is exactly cross entropy.",
+    )
     args = parser.parse_args()
     if args.epochs < 0:
         parser.error("--epochs must be >= 0")
+    if args.stage1_focal_gamma < 0:
+        parser.error("--stage1-focal-gamma must be >= 0")
 
     validate_public_example(args.data_root)
     artifacts = train_baseline(
@@ -28,6 +42,8 @@ def main() -> int:
         stages=tuple(dict.fromkeys(args.stages)),
         epochs=args.epochs,
         pretrained_stage2=args.pretrained_stage2,
+        stage1_feature_mode=args.stage1_feature_mode,
+        stage1_focal_gamma=args.stage1_focal_gamma,
     )
     for artifact in artifacts:
         print(f"[OK] {artifact} ({artifact.stat().st_size / 1024**2:.1f} MiB)")

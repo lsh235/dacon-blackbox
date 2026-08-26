@@ -1,23 +1,21 @@
-"""Stage 1 MViTv2-S baseline for original versus re-recorded videos."""
+"""Stage 1 MViTv2-S experiment for original versus re-recorded videos."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 
-import cv2
 import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torchvision.models.video import mvit_v2_s
 
 from blackbox.common.runtime import (
+    CheckpointError,
     DEFAULT_SEED,
-    S1_MEAN,
-    S1_STD,
     autocast_context,
-    center_clip,
     choose_device,
     load_checkpoint,
     release_device_cache,
@@ -25,12 +23,37 @@ from blackbox.common.runtime import (
     video_paths,
 )
 from blackbox.contracts import validate_prediction_frame
+from blackbox.stages.stage1.dataset import (
+    DEFAULT_FEATURE_MODE,
+    RGB_FEATURES,
+    Stage1InferenceDataset,
+    Stage1TrainingDataset,
+    feature_channels,
+)
+from blackbox.stages.stage1.losses import FocalLoss
+
+
+LABEL_TO_INDEX = {"ORIGINAL": 0, "RERECORDED": 1}
 
 
 class Stage1MViT(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, *, feature_mode: str = DEFAULT_FEATURE_MODE) -> None:
         super().__init__()
+        input_channels = feature_channels(feature_mode)
         self.net = mvit_v2_s(weights=None)
+        if input_channels != self.net.conv_proj.in_channels:
+            projection = self.net.conv_proj
+            self.net.conv_proj = nn.Conv3d(
+                input_channels,
+                projection.out_channels,
+                kernel_size=projection.kernel_size,
+                stride=projection.stride,
+                padding=projection.padding,
+                dilation=projection.dilation,
+                groups=projection.groups,
+                bias=projection.bias is not None,
+                padding_mode=projection.padding_mode,
+            )
         self.net.head[1] = nn.Linear(self.net.head[1].in_features, 2)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -43,104 +66,95 @@ def fit_stage1(
     *,
     epochs: int = 1,
     seed: int = DEFAULT_SEED,
+    feature_mode: str = DEFAULT_FEATURE_MODE,
+    focal_gamma: float = 2.0,
+    size: int = 224,
+    frames: int = 16,
+    batch_size: int = 1,
+    label_frame: pd.DataFrame | None = None,
 ) -> Path:
+    if epochs < 0:
+        raise ValueError("epochs must be >= 0")
+    if focal_gamma < 0:
+        raise ValueError("focal_gamma must be >= 0")
+    if size < 1 or frames < 1 or batch_size < 1:
+        raise ValueError("size, frames, and batch_size must be >= 1")
+    input_channels = feature_channels(feature_mode)
     seed_everything(seed)
     data_root = Path(data_dir)
     output = Path(model_dir)
     output.mkdir(parents=True, exist_ok=True)
-    labels = pd.read_csv(data_root / "labels.csv")
+    labels = pd.read_csv(data_root / "labels.csv") if label_frame is None else label_frame.copy()
+    required_columns = {"path", "label"}
+    missing_columns = sorted(required_columns - set(labels.columns))
+    if missing_columns:
+        raise ValueError(f"Stage 1 labels are missing columns: {missing_columns}")
+    labels["label"] = labels["label"].astype(str)
+    unknown_labels = sorted(set(labels["label"]) - set(LABEL_TO_INDEX))
+    if unknown_labels:
+        raise ValueError(f"unsupported Stage 1 labels: {unknown_labels}")
+    samples = [
+        (data_root / str(row.path), LABEL_TO_INDEX[str(row.label)])
+        for row in labels.itertuples(index=False)
+    ]
+    missing = [str(path) for path, _ in samples if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Stage 1 training videos not found: {missing}")
+
     device = choose_device()
-    model = Stage1MViT().to(device)
+    dataset = Stage1TrainingDataset(
+        samples,
+        size=size,
+        frames=frames,
+        feature_mode=feature_mode,
+    )
+    generator = torch.Generator().manual_seed(seed)
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=generator,
+        pin_memory=device.type == "cuda",
+    )
+    model = Stage1MViT(feature_mode=feature_mode).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    criterion = FocalLoss(gamma=focal_gamma)
     for _ in range(max(0, epochs)):
         model.train()
-        for row in labels.sample(frac=1, random_state=seed).itertuples():
-            clip, _ = center_clip(data_root / row.path, frames=16)
-            clip = (clip - S1_MEAN) / S1_STD
-            target = torch.tensor(
-                [0 if row.label == "ORIGINAL" else 1], dtype=torch.long, device=device
-            )
-            loss = nn.functional.cross_entropy(model(clip[None].to(device)), target)
-            optimizer.zero_grad()
+        for clips, targets in loader:
+            clips = clips.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            loss = criterion(model(clips), targets)
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
     checkpoint = output / "best.pt"
-    torch.save({"model": model.net.state_dict(), "size": 224, "frames": 16}, checkpoint)
-    del optimizer, model
+    torch.save(
+        {
+            "model": model.net.state_dict(),
+            "size": size,
+            "frames": frames,
+            "feature_mode": feature_mode,
+            "input_channels": input_channels,
+            "loss": {"name": "focal", "gamma": float(focal_gamma), "alpha": None},
+            "sampling": {"name": "uniform", "train_slots": 1},
+        },
+        checkpoint,
+    )
+    del criterion, dataset, loader, optimizer, model
     release_device_cache(device)
     return checkpoint
 
 
-def _clip_ids(path: Path, frame_count: int, slot: int, slots: int) -> np.ndarray:
-    capture = cv2.VideoCapture(str(path))
-    total = max(1, int(capture.get(cv2.CAP_PROP_FRAME_COUNT)))
-    capture.release()
-    center = (slot + 0.5) * total / slots
-    start = max(0, min(total - frame_count, round(center - frame_count / 2)))
-    return np.linspace(
-        start,
-        min(total - 1, start + frame_count - 1),
-        frame_count,
-    ).round().astype(int)
+def score_stage1_videos(
+    videos: Sequence[str | Path],
+    model_dir: str | Path,
+) -> list[float]:
+    """Return RERECORDED probabilities in input order for local evaluation."""
 
-
-def _decode_clip(path: Path, size: int, frame_ids: np.ndarray) -> torch.Tensor:
-    capture = cv2.VideoCapture(str(path))
-    output: list[np.ndarray] = []
-    wanted = [int(index) for index in frame_ids]
-    capture.set(cv2.CAP_PROP_POS_FRAMES, wanted[0])
-    position = wanted[0]
-    for index in wanted:
-        ok = False
-        bgr = None
-        while position <= index:
-            ok, bgr = capture.read()
-            position += 1
-            if not ok:
-                break
-        if not ok or bgr is None:
-            continue
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        height, width = rgb.shape[:2]
-        scale = size / min(height, width)
-        resized_height = max(size, round(height * scale))
-        resized_width = max(size, round(width * scale))
-        rgb = cv2.resize(rgb, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
-        y = (resized_height - size) // 2
-        x = (resized_width - size) // 2
-        output.append(rgb[y : y + size, x : x + size])
-    capture.release()
-    if not output:
-        raise ValueError(f"cannot decode video: {path.name}")
-    while len(output) < len(wanted):
-        output.append(output[-1])
-    clip = torch.from_numpy(np.stack(output)).permute(3, 0, 1, 2).float() / 255.0
-    return (clip - S1_MEAN) / S1_STD
-
-
-class _Stage1Clips(Dataset):
-    def __init__(self, videos: list[Path], slots: int, size: int, frames: int) -> None:
-        self.videos = videos
-        self.slots = slots
-        self.size = size
-        self.frames = frames
-
-    def __len__(self) -> int:
-        return len(self.videos) * self.slots
-
-    def __getitem__(self, index: int):
-        video_index, slot = index // self.slots, index % self.slots
-        path = self.videos[video_index]
-        try:
-            clip = _decode_clip(path, self.size, _clip_ids(path, self.frames, slot, self.slots))
-            valid = 1
-        except (OSError, ValueError, cv2.error):
-            clip = torch.zeros(3, self.frames, self.size, self.size)
-            valid = 0
-        return clip, video_index, valid
-
-
-def predict_stage1(data_dir, model_dir):
+    paths = [Path(video) for video in videos]
+    if not paths:
+        raise ValueError("Stage 1 scoring requires at least one video")
     device = choose_device(require_cuda=True)
     checkpoint = load_checkpoint(
         Path(model_dir) / "best.pt",
@@ -148,22 +162,35 @@ def predict_stage1(data_dir, model_dir):
     )
     size = int(checkpoint["size"])
     frame_count = int(checkpoint["frames"])
-    model = mvit_v2_s(weights=None)
-    model.head[1] = nn.Linear(model.head[1].in_features, 2)
+    feature_mode = str(checkpoint.get("feature_mode", RGB_FEATURES))
+    expected_channels = feature_channels(feature_mode)
+    input_channels = int(checkpoint.get("input_channels", expected_channels))
+    if input_channels != expected_channels:
+        raise CheckpointError(
+            "Stage 1 checkpoint preprocessing mismatch: "
+            f"feature_mode={feature_mode!r} requires {expected_channels} channels, "
+            f"checkpoint declares {input_channels}"
+        )
+    model = Stage1MViT(feature_mode=feature_mode).net
     model.load_state_dict(checkpoint["model"])
     model.to(device).eval()
 
-    videos = video_paths(Path(data_dir) / "videos")
     slots = 3
-    dataset = _Stage1Clips(videos, slots, size, frame_count)
-    workers = min(4, max(0, len(videos)))
+    dataset = Stage1InferenceDataset(
+        paths,
+        slots=slots,
+        size=size,
+        frames=frame_count,
+        feature_mode=feature_mode,
+    )
+    workers = min(4, len(paths))
     loader = DataLoader(
         dataset,
         batch_size=4,
         num_workers=workers,
         pin_memory=device.type == "cuda",
     )
-    scores: list[list[float]] = [[] for _ in videos]
+    scores: list[list[float]] = [[] for _ in paths]
     with torch.inference_mode():
         for clips, video_indices, valid in loader:
             with autocast_context(device):
@@ -176,16 +203,20 @@ def predict_stage1(data_dir, model_dir):
                 if ok:
                     scores[index].append(float(value))
 
-    rows = []
-    for path, values in zip(videos, scores):
-        probability = float(np.mean(values)) if values else 1.0
-        rows.append(
-            {
-                "ID": path.stem,
-                "answer": "RERECORDED" if probability >= 0.5 else "ORIGINAL",
-            }
-        )
     del model
     release_device_cache(device)
+    return [float(np.mean(values)) if values else 1.0 for values in scores]
+
+
+def predict_stage1(data_dir, model_dir):
+    videos = video_paths(Path(data_dir) / "videos")
+    probabilities = score_stage1_videos(videos, model_dir)
+    rows = [
+        {
+            "ID": path.stem,
+            "answer": "RERECORDED" if probability >= 0.5 else "ORIGINAL",
+        }
+        for path, probability in zip(videos, probabilities)
+    ]
     frame = pd.DataFrame(rows, columns=["ID", "answer"])
     return validate_prediction_frame("stage1", frame)

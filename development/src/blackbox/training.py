@@ -16,13 +16,21 @@ def train_baseline(
     stages: tuple[int, ...] = (1, 2, 3),
     epochs: int = 1,
     pretrained_stage2: bool = False,
+    stage1_feature_mode: str = "rgb_fft",
+    stage1_focal_gamma: float = 2.0,
 ) -> list[Path]:
     data = Path(data_root)
     model = Path(model_root)
     artifacts: list[Path] = []
     if 1 in stages:
         artifacts.append(
-            fit_stage1(data / "stage1", model / "stage1", epochs=epochs)
+            fit_stage1(
+                data / "stage1",
+                model / "stage1",
+                epochs=epochs,
+                feature_mode=stage1_feature_mode,
+                focal_gamma=stage1_focal_gamma,
+            )
         )
     if 2 in stages:
         checkpoint, backbone = fit_stage2(
