@@ -18,6 +18,8 @@ def train_baseline(
     pretrained_stage2: bool = False,
     stage1_feature_mode: str = "rgb_fft",
     stage1_focal_gamma: float = 2.0,
+    stage1_augmentation: bool = True,
+    stage1_tta_slots: int = 3,
 ) -> list[Path]:
     data = Path(data_root)
     model = Path(model_root)
@@ -30,6 +32,8 @@ def train_baseline(
                 epochs=epochs,
                 feature_mode=stage1_feature_mode,
                 focal_gamma=stage1_focal_gamma,
+                enable_augmentation=stage1_augmentation,
+                inference_tta_slots=stage1_tta_slots,
             )
         )
     if 2 in stages:

@@ -9,6 +9,8 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as transform_functional
 
 from blackbox.common.runtime import S1_MEAN, S1_STD
 
@@ -17,6 +19,135 @@ RGB_FEATURES = "rgb"
 RGB_FFT_FEATURES = "rgb_fft"
 DEFAULT_FEATURE_MODE = RGB_FFT_FEATURES
 _FEATURE_CHANNELS = {RGB_FEATURES: 3, RGB_FFT_FEATURES: 6}
+
+
+class Stage1TrainAugmentation:
+    """Apply weak re-recording-style changes consistently across one clip.
+
+    Color jitter approximates display brightness/reflection and color-response
+    changes. A small affine transform approximates a hand-held re-recording
+    angle. The *same* sampled parameters are applied to all frames so the
+    augmentation does not invent temporal flicker. Blur and random crops are
+    deliberately omitted because they can erase the fine moire evidence this
+    Stage 1 experiment is intended to retain.
+    """
+
+    def __init__(
+        self,
+        *,
+        color_jitter_probability: float = 0.8,
+        affine_probability: float = 0.35,
+        brightness: float = 0.15,
+        contrast: float = 0.15,
+        saturation: float = 0.12,
+        max_degrees: float = 2.0,
+        max_translate: float = 0.02,
+    ) -> None:
+        probabilities = {
+            "color_jitter_probability": color_jitter_probability,
+            "affine_probability": affine_probability,
+        }
+        invalid_probabilities = {
+            name: value for name, value in probabilities.items() if not 0.0 <= value <= 1.0
+        }
+        if invalid_probabilities:
+            raise ValueError(f"augmentation probabilities must be in [0, 1]: {invalid_probabilities}")
+        magnitudes = {
+            "brightness": brightness,
+            "contrast": contrast,
+            "saturation": saturation,
+            "max_degrees": max_degrees,
+            "max_translate": max_translate,
+        }
+        invalid_magnitudes = {name: value for name, value in magnitudes.items() if value < 0.0}
+        if invalid_magnitudes:
+            raise ValueError(f"augmentation magnitudes must be non-negative: {invalid_magnitudes}")
+        if brightness >= 1.0 or contrast >= 1.0 or saturation >= 1.0:
+            raise ValueError("brightness, contrast, and saturation must be < 1.0")
+
+        self.color_jitter_probability = float(color_jitter_probability)
+        self.affine_probability = float(affine_probability)
+        self.brightness = float(brightness)
+        self.contrast = float(contrast)
+        self.saturation = float(saturation)
+        self.max_degrees = float(max_degrees)
+        self.max_translate = float(max_translate)
+
+    @staticmethod
+    def _apply_to_frames(
+        frames: torch.Tensor,
+        operation,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run a torchvision transform per frame while sharing its parameters."""
+
+        return torch.stack(
+            [operation(frame, *args, **kwargs) for frame in frames],
+            dim=0,
+        )
+
+    def __call__(self, rgb_clip: torch.Tensor) -> torch.Tensor:
+        if rgb_clip.ndim != 4 or rgb_clip.shape[0] != 3:
+            raise ValueError(
+                "rgb_clip must have shape [3, time, height, width], "
+                f"got {tuple(rgb_clip.shape)}"
+            )
+        # torchvision image transforms expect [C, H, W].  Move time to the
+        # batch position, while retaining one shared set of random parameters.
+        frames = rgb_clip.permute(1, 0, 2, 3).contiguous()
+
+        if bool(torch.rand(()) < self.color_jitter_probability):
+            operations = (
+                (
+                    transform_functional.adjust_brightness,
+                    1.0 + float(torch.empty(()).uniform_(-self.brightness, self.brightness)),
+                ),
+                (
+                    transform_functional.adjust_contrast,
+                    1.0 + float(torch.empty(()).uniform_(-self.contrast, self.contrast)),
+                ),
+                (
+                    transform_functional.adjust_saturation,
+                    1.0 + float(torch.empty(()).uniform_(-self.saturation, self.saturation)),
+                ),
+            )
+            for operation_index in torch.randperm(len(operations)).tolist():
+                operation, factor = operations[operation_index]
+                frames = self._apply_to_frames(frames, operation, factor)
+
+        if bool(torch.rand(()) < self.affine_probability):
+            height, width = frames.shape[-2:]
+            angle = float(torch.empty(()).uniform_(-self.max_degrees, self.max_degrees))
+            translate = [
+                int(round(float(torch.empty(()).uniform_(-self.max_translate, self.max_translate)) * width)),
+                int(round(float(torch.empty(()).uniform_(-self.max_translate, self.max_translate)) * height)),
+            ]
+            frames = self._apply_to_frames(
+                frames,
+                transform_functional.affine,
+                angle,
+                translate,
+                1.0,
+                [0.0, 0.0],
+                interpolation=InterpolationMode.BILINEAR,
+                fill=0.0,
+            )
+
+        return frames.clamp(0.0, 1.0).permute(1, 0, 2, 3).contiguous()
+
+    def checkpoint_config(self) -> dict[str, float]:
+        """Serialize the experiment parameters with a Stage 1 checkpoint."""
+
+        return {
+            "color_jitter_probability": self.color_jitter_probability,
+            "affine_probability": self.affine_probability,
+            "brightness": self.brightness,
+            "contrast": self.contrast,
+            "saturation": self.saturation,
+            "max_degrees": self.max_degrees,
+            "max_translate": self.max_translate,
+        }
 
 
 def feature_channels(feature_mode: str) -> int:
@@ -177,6 +308,7 @@ class Stage1TrainingDataset(Dataset):
         frames: int,
         feature_mode: str,
         slots: int = 1,
+        augmentation: Stage1TrainAugmentation | None = None,
     ) -> None:
         if not samples:
             raise ValueError("Stage 1 training samples must not be empty")
@@ -191,6 +323,7 @@ class Stage1TrainingDataset(Dataset):
         self.frames = frames
         self.feature_mode = feature_mode
         self.slots = slots
+        self.augmentation = augmentation
 
     def __len__(self) -> int:
         return len(self.samples) * self.slots
@@ -205,6 +338,8 @@ class Stage1TrainingDataset(Dataset):
             slot=slot,
             slots=self.slots,
         )
+        if self.augmentation is not None:
+            rgb_clip = self.augmentation(rgb_clip)
         return prepare_stage1_features(rgb_clip, self.feature_mode), label
 
 

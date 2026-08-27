@@ -29,11 +29,24 @@ def main() -> int:
         default=2.0,
         help="Focal modulation strength; 0 is exactly cross entropy.",
     )
+    parser.add_argument(
+        "--stage1-no-augmentation",
+        action="store_true",
+        help="Disable weak, clip-consistent ColorJitter and RandomAffine for Stage 1 training.",
+    )
+    parser.add_argument(
+        "--stage1-tta-slots",
+        type=int,
+        default=3,
+        help="Number of early/middle/late temporal samples averaged for Stage 1 inference.",
+    )
     args = parser.parse_args()
     if args.epochs < 0:
         parser.error("--epochs must be >= 0")
     if args.stage1_focal_gamma < 0:
         parser.error("--stage1-focal-gamma must be >= 0")
+    if args.stage1_tta_slots < 1:
+        parser.error("--stage1-tta-slots must be >= 1")
 
     validate_public_example(args.data_root)
     artifacts = train_baseline(
@@ -44,6 +57,8 @@ def main() -> int:
         pretrained_stage2=args.pretrained_stage2,
         stage1_feature_mode=args.stage1_feature_mode,
         stage1_focal_gamma=args.stage1_focal_gamma,
+        stage1_augmentation=not args.stage1_no_augmentation,
+        stage1_tta_slots=args.stage1_tta_slots,
     )
     for artifact in artifacts:
         print(f"[OK] {artifact} ({artifact.stat().st_size / 1024**2:.1f} MiB)")

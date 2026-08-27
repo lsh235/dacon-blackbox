@@ -27,6 +27,7 @@ from blackbox.stages.stage1.dataset import (
     DEFAULT_FEATURE_MODE,
     RGB_FEATURES,
     Stage1InferenceDataset,
+    Stage1TrainAugmentation,
     Stage1TrainingDataset,
     feature_channels,
 )
@@ -34,6 +35,23 @@ from blackbox.stages.stage1.losses import FocalLoss
 
 
 LABEL_TO_INDEX = {"ORIGINAL": 0, "RERECORDED": 1}
+DEFAULT_TTA_SLOTS = 3
+
+
+def resolve_tta_slots(checkpoint: dict[str, object]) -> int:
+    """Read temporal TTA slots, while keeping legacy checkpoints usable."""
+
+    sampling = checkpoint.get("sampling", {})
+    if not isinstance(sampling, dict):
+        raise CheckpointError("Stage 1 checkpoint sampling metadata must be a mapping")
+    value = sampling.get("inference_tta_slots", DEFAULT_TTA_SLOTS)
+    try:
+        slots = int(value)
+    except (TypeError, ValueError) as exc:
+        raise CheckpointError(f"Stage 1 inference_tta_slots must be an integer, got {value!r}") from exc
+    if slots < 1:
+        raise CheckpointError(f"Stage 1 inference_tta_slots must be >= 1, got {slots}")
+    return slots
 
 
 class Stage1MViT(nn.Module):
@@ -71,6 +89,8 @@ def fit_stage1(
     size: int = 224,
     frames: int = 16,
     batch_size: int = 1,
+    enable_augmentation: bool = True,
+    inference_tta_slots: int = DEFAULT_TTA_SLOTS,
     label_frame: pd.DataFrame | None = None,
 ) -> Path:
     if epochs < 0:
@@ -79,6 +99,8 @@ def fit_stage1(
         raise ValueError("focal_gamma must be >= 0")
     if size < 1 or frames < 1 or batch_size < 1:
         raise ValueError("size, frames, and batch_size must be >= 1")
+    if inference_tta_slots < 1:
+        raise ValueError("inference_tta_slots must be >= 1")
     input_channels = feature_channels(feature_mode)
     seed_everything(seed)
     data_root = Path(data_dir)
@@ -102,11 +124,13 @@ def fit_stage1(
         raise FileNotFoundError(f"Stage 1 training videos not found: {missing}")
 
     device = choose_device()
+    augmentation = Stage1TrainAugmentation() if enable_augmentation else None
     dataset = Stage1TrainingDataset(
         samples,
         size=size,
         frames=frames,
         feature_mode=feature_mode,
+        augmentation=augmentation,
     )
     generator = torch.Generator().manual_seed(seed)
     loader = DataLoader(
@@ -137,7 +161,17 @@ def fit_stage1(
             "feature_mode": feature_mode,
             "input_channels": input_channels,
             "loss": {"name": "focal", "gamma": float(focal_gamma), "alpha": None},
-            "sampling": {"name": "uniform", "train_slots": 1},
+            "sampling": {
+                "name": "uniform",
+                "train_slots": 1,
+                "inference_tta_slots": int(inference_tta_slots),
+                "aggregation": "mean_rerecorded_probability",
+            },
+            "augmentation": (
+                {"enabled": True, **augmentation.checkpoint_config()}
+                if augmentation is not None
+                else {"enabled": False}
+            ),
         },
         checkpoint,
     )
@@ -149,8 +183,10 @@ def fit_stage1(
 def score_stage1_videos(
     videos: Sequence[str | Path],
     model_dir: str | Path,
+    *,
+    tta_slots: int | None = None,
 ) -> list[float]:
-    """Return RERECORDED probabilities in input order for local evaluation."""
+    """Average RERECORDED probabilities over early/middle/late video slots."""
 
     paths = [Path(video) for video in videos]
     if not paths:
@@ -175,7 +211,9 @@ def score_stage1_videos(
     model.load_state_dict(checkpoint["model"])
     model.to(device).eval()
 
-    slots = 3
+    slots = resolve_tta_slots(checkpoint) if tta_slots is None else int(tta_slots)
+    if slots < 1:
+        raise ValueError("tta_slots must be >= 1")
     dataset = Stage1InferenceDataset(
         paths,
         slots=slots,
