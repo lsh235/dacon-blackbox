@@ -7,10 +7,25 @@ from pathlib import Path
 
 import torch
 
+from blackbox.experiment_config import load_experiment_config, stage_paths
 from blackbox.training_control import EarlyStopping, JsonlTrainingLogger, cosine_scheduler
 
 
 class TrainingControlTests(unittest.TestCase):
+    def test_yaml_configuration_resolves_paths_relative_to_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_path = Path(temporary) / "configs" / "trial.yaml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                "data:\n  root: ../raw\n  processed_root: ../processed\nrun:\n  model_root: ../models\n",
+                encoding="utf-8",
+            )
+            config, resolved = load_experiment_config(config_path)
+            data_dir, model_dir, processed_dir = stage_paths(config, resolved, "stage2")
+        self.assertEqual(data_dir, (Path(temporary) / "raw" / "stage2").resolve())
+        self.assertEqual(model_dir, (Path(temporary) / "models" / "stage2").resolve())
+        self.assertEqual(processed_dir, (Path(temporary) / "processed").resolve())
+
     def test_cosine_logger_and_early_stopping_record_epoch_history(self) -> None:
         parameter = torch.nn.Parameter(torch.tensor(1.0))
         optimizer = torch.optim.SGD([parameter], lr=0.1)

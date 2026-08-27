@@ -1,0 +1,53 @@
+# RGB + Farneback + BiLSTM experiment. Preprocess all listed windows first.
+data:
+  root: ../data/raw/public_example
+  inference_root: ../data/interim/smoke_eval
+  processed_root: ../data/processed
+
+run:
+  model_root: ../artifacts/config-two-stream/models
+  output_root: ../artifacts/config-two-stream/submissions
+  epochs: 10
+  stages: [1, 2, 3]
+
+training:
+  min_learning_rate: 0.000001
+  early_stopping_patience: 4
+  early_stopping_min_delta: 0.0001
+  validation_fraction: 0.2
+  log_dir: ../logs
+
+stage1:
+  feature_mode: rgb_fft
+  focal_gamma: 2.0
+  size: 224
+  frames: 16
+  batch_size: 1
+  augmentation: true
+  inference_tta_slots: 3
+
+stage2:
+  architecture: two_stream
+  window_frames: 64
+  stride: 32
+  size: 224
+  batch_size: 1
+  frame_batch_size: 8
+  learning_rate: 0.0002
+  target_mode: gaussian
+  gaussian_sigma: 2.0
+  aggregation_policy: mean
+
+stage3:
+  architecture: two_stream
+  window_frames: 96
+  stride: 48
+  size: 224
+  batch_size: 1
+  frame_batch_size: 8
+  learning_rate: 0.0002
+  frames_per_sample: null
+
+preprocessing:
+  stage1_slots: 1
+  max_windows_per_video: null

@@ -13,13 +13,14 @@ from torch.utils.data import DataLoader
 from blackbox.common.runtime import DEFAULT_SEED, choose_device, release_device_cache, seed_everything
 from blackbox.stages.stage3.baseline import fit_stage3
 from blackbox.stages.stage3.dataset_stage3 import (
-    DEFAULT_STAGE3_FLOW_CACHE_DIR,
     IGNORE_INDEX,
     FarnebackConfig,
     Stage3SequenceWindowDataset,
     collate_stage3_windows,
     read_stage3_records,
 )
+from blackbox.preprocessing import DEFAULT_PROCESSED_ROOT
+from blackbox.experiment_config import config_path_value, load_experiment_config, section, stage_paths
 from blackbox.stages.stage3.model_stage3 import Stage3TwoStreamBiLSTM
 from blackbox.training_control import (
     EarlyStopping,
@@ -41,7 +42,7 @@ class Stage3TwoStreamTrainingConfig:
     frame_batch_size: int = 8
     learning_rate: float = 2e-4
     num_workers: int = 0
-    flow_cache_dir: str | Path | None = DEFAULT_STAGE3_FLOW_CACHE_DIR
+    processed_root: str | Path = DEFAULT_PROCESSED_ROOT
     farneback: FarnebackConfig = FarnebackConfig()
     training_control: TrainingControlConfig = TrainingControlConfig()
 
@@ -127,7 +128,7 @@ def fit_stage3_two_stream_skeleton(
         stride=config.stride,
         size=config.size,
         farneback_config=config.farneback,
-        flow_cache_dir=config.flow_cache_dir,
+        processed_root=config.processed_root,
     )
     train_loader = DataLoader(
         train_dataset,
@@ -144,7 +145,7 @@ def fit_stage3_two_stream_skeleton(
             stride=config.stride,
             size=config.size,
             farneback_config=config.farneback,
-            flow_cache_dir=config.flow_cache_dir,
+            processed_root=config.processed_root,
         )
         if valid_records
         else None
@@ -219,50 +220,74 @@ from blackbox.training_control import TrainingControlConfig
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data-dir", type=Path, required=True)
-    parser.add_argument("--model-dir", type=Path, required=True)
-    parser.add_argument("--architecture", choices=("baseline", "two-stream"), default="baseline")
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--min-learning-rate", type=float, default=1e-6)
-    parser.add_argument("--early-stopping-patience", type=int, default=5)
-    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
-    parser.add_argument("--validation-fraction", type=float, default=0.2)
+    parser.add_argument("--config", type=Path, help="YAML experiment configuration")
+    parser.add_argument("--data-dir", type=Path)
+    parser.add_argument("--model-dir", type=Path)
+    parser.add_argument("--architecture", choices=("baseline", "two-stream"))
+    parser.add_argument("--epochs", type=int)
+    parser.add_argument("--min-learning-rate", type=float)
+    parser.add_argument("--early-stopping-patience", type=int)
+    parser.add_argument("--early-stopping-min-delta", type=float)
+    parser.add_argument("--validation-fraction", type=float)
     parser.add_argument("--log-dir", type=Path)
-    parser.add_argument("--window-frames", type=int, default=96)
-    parser.add_argument("--stride", type=int, default=48)
-    parser.add_argument("--size", type=int, default=224)
-    parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument("--frame-batch-size", type=int, default=8)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--flow-cache-dir", type=Path, default=DEFAULT_STAGE3_FLOW_CACHE_DIR)
+    parser.add_argument("--window-frames", type=int)
+    parser.add_argument("--stride", type=int)
+    parser.add_argument("--size", type=int)
+    parser.add_argument("--batch-size", type=int)
+    parser.add_argument("--frame-batch-size", type=int)
+    parser.add_argument("--num-workers", type=int)
+    parser.add_argument("--processed-root", type=Path)
     args = parser.parse_args()
-    control = TrainingControlConfig(
-        min_learning_rate=args.min_learning_rate,
-        early_stopping_patience=args.early_stopping_patience,
-        early_stopping_min_delta=args.early_stopping_min_delta,
-        validation_fraction=args.validation_fraction,
-        log_dir=args.log_dir,
+    config: dict[str, object] = {}
+    config_path: Path | None = None
+    if args.config is not None:
+        config, config_path = load_experiment_config(args.config)
+    stage = section(config, "stage3")
+    training = section(config, "training")
+    if config_path is not None:
+        configured_data, configured_model, configured_processed = stage_paths(config, config_path, "stage3")
+    else:
+        configured_data = configured_model = configured_processed = None
+    data_dir = args.data_dir or configured_data
+    model_dir = args.model_dir or configured_model
+    processed_root = args.processed_root or configured_processed
+    if data_dir is None or model_dir is None or processed_root is None:
+        parser.error("--config or --data-dir, --model-dir, and --processed-root are required")
+    log_dir = args.log_dir or (
+        config_path_value(config_path, training.get("log_dir"), field="training.log_dir")
+        if config_path is not None and training.get("log_dir") is not None
+        else None
     )
-    if args.architecture == "baseline":
+    control = TrainingControlConfig(
+        min_learning_rate=args.min_learning_rate if args.min_learning_rate is not None else float(training.get("min_learning_rate", 1e-6)),
+        early_stopping_patience=args.early_stopping_patience if args.early_stopping_patience is not None else int(training.get("early_stopping_patience", 5)),
+        early_stopping_min_delta=args.early_stopping_min_delta if args.early_stopping_min_delta is not None else float(training.get("early_stopping_min_delta", 0.0)),
+        validation_fraction=args.validation_fraction if args.validation_fraction is not None else float(training.get("validation_fraction", 0.2)),
+        log_dir=log_dir,
+    )
+    architecture = args.architecture or str(stage.get("architecture", "baseline"))
+    epochs = args.epochs if args.epochs is not None else int(config.get("run", {}).get("epochs", 1))
+    if architecture == "baseline":
         checkpoint = fit_stage3(
-            args.data_dir,
-            args.model_dir,
-            epochs=args.epochs,
+            data_dir,
+            model_dir,
+            epochs=epochs,
             training_control=control,
         )
     else:
         checkpoint = fit_stage3_two_stream_skeleton(
-            args.data_dir,
-            args.model_dir,
-            epochs=args.epochs,
+            data_dir,
+            model_dir,
+            epochs=epochs,
             config=Stage3TwoStreamTrainingConfig(
-                window_frames=args.window_frames,
-                stride=args.stride,
-                size=args.size,
-                batch_size=args.batch_size,
-                frame_batch_size=args.frame_batch_size,
-                num_workers=args.num_workers,
-                flow_cache_dir=args.flow_cache_dir,
+                window_frames=args.window_frames if args.window_frames is not None else int(stage.get("window_frames", 96)),
+                stride=args.stride if args.stride is not None else int(stage.get("stride", 48)),
+                size=args.size if args.size is not None else int(stage.get("size", 224)),
+                batch_size=args.batch_size if args.batch_size is not None else int(stage.get("batch_size", 1)),
+                frame_batch_size=args.frame_batch_size if args.frame_batch_size is not None else int(stage.get("frame_batch_size", 8)),
+                learning_rate=float(stage.get("learning_rate", 2e-4)),
+                num_workers=args.num_workers if args.num_workers is not None else int(stage.get("num_workers", 0)),
+                processed_root=processed_root,
                 training_control=control,
             ),
         )

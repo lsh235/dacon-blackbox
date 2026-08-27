@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from blackbox.stages.stage3.dataset_stage3 import (
 )
 from blackbox.stages.stage3.model_stage3 import Stage3TwoStreamBiLSTM
 from blackbox.stages.stage3.train_stage3 import stage3_sequence_loss
+from blackbox.preprocessing import PREPROCESS_SCHEMA
 
 
 class Stage3SequenceDatasetTests(unittest.TestCase):
@@ -26,6 +28,34 @@ class Stage3SequenceDatasetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             video = Path(temporary) / "OPEN_001.mp4"
             video.write_bytes(b"stage3-fixture")
+            processed_root = Path(temporary) / "processed"
+            window_root = processed_root / "stage3" / "windows"
+            (window_root / "rgb").mkdir(parents=True)
+            (window_root / "flow").mkdir(parents=True)
+            import numpy as np
+
+            np.save(window_root / "rgb" / "fixture.npy", frames.numpy())
+            np.save(window_root / "flow" / "fixture.npy", torch.zeros(6, 2, 16, 16).numpy())
+            (window_root / "manifest.json").write_text(json.dumps({
+                "schema": PREPROCESS_SCHEMA,
+                "stage": "stage3",
+                "entries": [{
+                    "id": "OPEN_001",
+                    "source": str(video.resolve()),
+                    "start_frame": 0,
+                    "end_frame": 6,
+                    "valid_length": 6,
+                    "window_frames": 6,
+                    "stride": 6,
+                    "size": 16,
+                    "farneback": {
+                        "pyr_scale": 0.5, "levels": 3, "winsize": 15, "iterations": 3,
+                        "poly_n": 5, "poly_sigma": 1.2, "flags": 0, "flow_clip": 20.0,
+                    },
+                    "rgb": "rgb/fixture.npy",
+                    "flow": "flow/fixture.npy",
+                }],
+            }))
             record = Stage3VideoRecord(
                 "OPEN_001",
                 video,
@@ -35,10 +65,9 @@ class Stage3SequenceDatasetTests(unittest.TestCase):
                 ),
             )
             with (
-                patch("blackbox.stages.stage2.dataset_stage2.video_frame_count", return_value=6),
                 patch(
                     "blackbox.stages.stage2.dataset_stage2.decode_stage2_window",
-                    return_value=(frames, 6),
+                    side_effect=AssertionError("loader must not decode raw videos"),
                 ),
                 patch(
                     "blackbox.stages.stage3.dataset_stage3.read_stage3_time_axis",
@@ -50,7 +79,7 @@ class Stage3SequenceDatasetTests(unittest.TestCase):
                     window_frames=6,
                     stride=6,
                     size=16,
-                    flow_cache_dir=Path(temporary) / "cache",
+                    processed_root=processed_root,
                 )
                 sample = dataset[0]
         self.assertEqual(sample["frame_numbers"].tolist(), [0, 3])

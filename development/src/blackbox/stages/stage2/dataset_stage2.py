@@ -22,6 +22,8 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+from blackbox.preprocessing import DEFAULT_PROCESSED_ROOT, load_processed_window_entries
+
 
 IGNORE_INDEX = -100
 ENTRY_SIDE_TO_INDEX = {"LEFT": 0, "RIGHT": 1}
@@ -79,6 +81,9 @@ class Stage2Window:
     start_frame: int
     end_frame: int
     flow_cache_key: str | None = None
+    processed_rgb_path: Path | None = None
+    processed_flow_path: Path | None = None
+    valid_length: int | None = None
 
 
 def _optional_integer(value: object, *, field: str, allowed: set[int] | None = None) -> int:
@@ -354,12 +359,11 @@ def local_event_target(event_frame: int, *, start_frame: int, valid_length: int)
 
 
 class Stage2SlidingWindowDataset(Dataset):
-    """Lazy window dataset for CNN+sequence models.
+    """Processed-only RGB/flow window loader for two-stream training.
 
-    ``__init__`` touches frame-count metadata only.  ``__getitem__`` opens one
-    video, decodes one chunk, and immediately returns a fixed-size tensor.
-    The original-frame map lets inference convert a local argmax back to the
-    official ``collision_frame``/``entry_frame`` values.
+    Expensive decode and Farneback work is intentionally prohibited here.  A
+    missing manifest is an actionable preprocessing error rather than a quiet
+    fallback that would leave the GPU waiting for CPU feature extraction.
     """
 
     def __init__(
@@ -371,7 +375,8 @@ class Stage2SlidingWindowDataset(Dataset):
         size: int = 224,
         include_flow: bool = True,
         farneback_config: FarnebackConfig = FarnebackConfig(),
-        flow_cache_dir: str | Path | None = DEFAULT_OPTICAL_FLOW_CACHE_DIR,
+        processed_root: str | Path = DEFAULT_PROCESSED_ROOT,
+        processed_stage: str = "stage2",
     ) -> None:
         if not records:
             raise ValueError("Stage 2 records must not be empty")
@@ -381,50 +386,59 @@ class Stage2SlidingWindowDataset(Dataset):
         self.size = size
         self.include_flow = include_flow
         self.farneback_config = farneback_config
-        self.flow_cache_dir = None if flow_cache_dir is None else Path(flow_cache_dir)
+        self.processed_root = Path(processed_root)
+        if processed_stage not in {"stage2", "stage3"}:
+            raise ValueError("processed_stage must be 'stage2' or 'stage3'")
         self.windows: list[Stage2Window] = []
-        # These counters are intentionally process-local.  They make the
-        # single-worker smoke run observable; multi-worker production metrics
-        # should be collected from worker logs instead.
+        # Kept for existing experiment logs: a processed read is a hit, and a
+        # miss can never trigger an online Farneback calculation.
         self.flow_cache_hits = 0
         self.flow_cache_misses = 0
-        video_hashes: dict[Path, str] = {}
-        for record in records:
-            total_frames = video_frame_count(record.video_path)
-            if include_flow and self.flow_cache_dir is not None:
-                video_hashes[record.video_path] = _video_content_hash(record.video_path)
-            for start_frame in sliding_window_starts(total_frames, window_frames, stride):
-                end_frame = min(start_frame + window_frames, total_frames)
-                cache_key = None
-                if include_flow and self.flow_cache_dir is not None:
-                    cache_key = flow_cache_key(
-                        video_hash=video_hashes[record.video_path],
-                        start_frame=start_frame,
-                        end_frame=end_frame,
-                        window_frames=window_frames,
-                        size=size,
-                        config=farneback_config,
-                    )
-                self.windows.append(
-                    Stage2Window(
-                        record=record,
-                        start_frame=start_frame,
-                        end_frame=end_frame,
-                        flow_cache_key=cache_key,
-                    )
+        records_by_source = {
+            (record.video_id, str(record.video_path.resolve())): record for record in records
+        }
+        # Stage 3 wraps this class with unlabeled Stage2VideoRecords and passes
+        # its own manifest namespace explicitly.
+        self.processed_stage = processed_stage
+        entries = load_processed_window_entries(
+            self.processed_root,
+            stage=self.processed_stage,
+            records=[(record.video_id, record.video_path) for record in records],
+            window_frames=window_frames,
+            stride=stride,
+            size=size,
+            farneback=asdict(farneback_config),
+        )
+        manifest_root = self.processed_root / self.processed_stage / "windows"
+        for entry in entries:
+            record = records_by_source[(str(entry["id"]), str(entry["source"]))]
+            self.windows.append(
+                Stage2Window(
+                    record=record,
+                    start_frame=int(entry["start_frame"]),
+                    end_frame=int(entry["end_frame"]),
+                    processed_rgb_path=manifest_root / str(entry["rgb"]),
+                    processed_flow_path=manifest_root / str(entry["flow"]),
+                    valid_length=int(entry["valid_length"]),
                 )
+            )
 
     def __len__(self) -> int:
         return len(self.windows)
 
     def __getitem__(self, index: int) -> dict[str, object]:
         window = self.windows[index]
-        frames, valid_length = decode_stage2_window(
-            window.record.video_path,
-            start_frame=window.start_frame,
-            window_frames=self.window_frames,
-            size=self.size,
-        )
+        if window.processed_rgb_path is None or window.valid_length is None:
+            raise RuntimeError("Stage 2 window is missing offline RGB preprocessing metadata")
+        try:
+            rgb_array = np.load(window.processed_rgb_path, allow_pickle=False)
+        except (OSError, ValueError) as exc:
+            raise FileNotFoundError(f"missing processed RGB window: {window.processed_rgb_path}") from exc
+        expected_rgb = (self.window_frames, 3, self.size, self.size)
+        if rgb_array.shape != expected_rgb or rgb_array.dtype != np.float32 or not np.isfinite(rgb_array).all():
+            raise ValueError(f"invalid processed RGB window: {window.processed_rgb_path}")
+        frames = torch.from_numpy(np.ascontiguousarray(rgb_array.copy()))
+        valid_length = window.valid_length
         frame_numbers = torch.arange(window.start_frame, window.start_frame + self.window_frames)
         frame_numbers[valid_length:] = window.start_frame + valid_length - 1
         sample: dict[str, object] = {
@@ -460,28 +474,18 @@ class Stage2SlidingWindowDataset(Dataset):
             ),
         }
         if self.include_flow:
-            flow_cache_hit = False
-            cache_path = (
-                None
-                if self.flow_cache_dir is None or window.flow_cache_key is None
-                else self.flow_cache_dir / f"{window.flow_cache_key}.npy"
-            )
             expected_shape = (self.window_frames, 2, self.size, self.size)
-            flow = None if cache_path is None else _load_flow_cache(cache_path, expected_shape=expected_shape)
-            if flow is None:
-                flow = farneback_optical_flow(
-                    frames,
-                    valid_length=valid_length,
-                    config=self.farneback_config,
-                )
-                self.flow_cache_misses += 1
-                if cache_path is not None:
-                    _store_flow_cache(cache_path, flow)
-            else:
-                flow_cache_hit = True
-                self.flow_cache_hits += 1
-            sample["flow"] = flow
-            sample["flow_cache_hit"] = torch.tensor(flow_cache_hit, dtype=torch.bool)
+            if window.processed_flow_path is None:
+                raise RuntimeError("Stage 2 window is missing offline flow preprocessing metadata")
+            try:
+                flow_array = np.load(window.processed_flow_path, allow_pickle=False)
+            except (OSError, ValueError) as exc:
+                raise FileNotFoundError(f"missing processed flow window: {window.processed_flow_path}") from exc
+            if flow_array.shape != expected_shape or flow_array.dtype != np.float32 or not np.isfinite(flow_array).all():
+                raise ValueError(f"invalid processed flow window: {window.processed_flow_path}")
+            self.flow_cache_hits += 1
+            sample["flow"] = torch.from_numpy(np.ascontiguousarray(flow_array.copy()))
+            sample["flow_cache_hit"] = torch.tensor(True, dtype=torch.bool)
         return sample
 
 

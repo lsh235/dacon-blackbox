@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from blackbox.stages.stage2.dataset_stage2 import (
     local_event_target,
     sliding_window_starts,
 )
+from blackbox.preprocessing import PREPROCESS_SCHEMA
 from blackbox.stages.stage2.model_stage2 import Stage2CnnBiLSTM, Stage2TwoStreamBiLSTM
 from blackbox.stages.stage2.inference_stage2 import predict_two_stream_event_frames
 from blackbox.stages.stage2.train_stage2 import (
@@ -61,43 +63,62 @@ class Stage2SlidingWindowTests(unittest.TestCase):
         self.assertLessEqual(float(flow.abs().max()), 1.0)
         self.assertGreater(float(flow[2, 0, 8:20, 12:24].mean()), 0.0)
 
-    def test_dataset_reuses_flow_cache_for_same_window(self) -> None:
+    def test_dataset_reads_preprocessed_rgb_and_flow_without_online_compute(self) -> None:
         frames = torch.zeros(3, 3, 16, 16)
         frames[1, :, 4:10, 5:11] = 1.0
         frames[2, :, 4:10, 6:12] = 1.0
+        flow = farneback_optical_flow(frames, valid_length=3)
         with tempfile.TemporaryDirectory() as temporary:
             video = Path(temporary) / "window.mp4"
             video.write_bytes(b"content-hash-fixture")
-            cache_dir = Path(temporary) / "cache"
+            processed_root = Path(temporary) / "processed"
+            window_root = processed_root / "stage2" / "windows"
+            (window_root / "rgb").mkdir(parents=True)
+            (window_root / "flow").mkdir(parents=True)
+            import numpy as np
+
+            np.save(window_root / "rgb" / "fixture.npy", frames.numpy())
+            np.save(window_root / "flow" / "fixture.npy", flow.numpy())
+            (window_root / "manifest.json").write_text(json.dumps({
+                "schema": PREPROCESS_SCHEMA,
+                "stage": "stage2",
+                "entries": [{
+                    "id": "fixture",
+                    "source": str(video.resolve()),
+                    "start_frame": 0,
+                    "end_frame": 3,
+                    "valid_length": 3,
+                    "window_frames": 3,
+                    "stride": 3,
+                    "size": 16,
+                    "farneback": {
+                        "pyr_scale": 0.5, "levels": 3, "winsize": 15, "iterations": 3,
+                        "poly_n": 5, "poly_sigma": 1.2, "flags": 0, "flow_clip": 20.0,
+                    },
+                    "rgb": "rgb/fixture.npy",
+                    "flow": "flow/fixture.npy",
+                }],
+            }))
             record = Stage2VideoRecord("fixture", video, collision_frame=1)
-            with (
-                patch("blackbox.stages.stage2.dataset_stage2.video_frame_count", return_value=3),
-                patch(
-                    "blackbox.stages.stage2.dataset_stage2.decode_stage2_window",
-                    return_value=(frames, 3),
-                ),
-                patch(
-                    "blackbox.stages.stage2.dataset_stage2.farneback_optical_flow",
-                    wraps=farneback_optical_flow,
-                ) as calculate_flow,
-                ):
+            with patch(
+                "blackbox.stages.stage2.dataset_stage2.decode_stage2_window",
+                side_effect=AssertionError("loader must not decode raw videos"),
+            ):
                 dataset = Stage2SlidingWindowDataset(
                     [record],
                     window_frames=3,
                     stride=3,
                     size=16,
-                    flow_cache_dir=cache_dir,
+                    processed_root=processed_root,
                 )
                 first = dataset[0]
                 second = dataset[0]
-                cache_file_count = len(list(cache_dir.glob("*.npy")))
-        self.assertEqual(calculate_flow.call_count, 1)
-        self.assertFalse(bool(first["flow_cache_hit"]))
+        self.assertTrue(bool(first["flow_cache_hit"]))
         self.assertTrue(bool(second["flow_cache_hit"]))
         self.assertTrue(torch.equal(first["flow"], second["flow"]))
-        self.assertEqual(dataset.flow_cache_misses, 1)
-        self.assertEqual(dataset.flow_cache_hits, 1)
-        self.assertEqual(cache_file_count, 1)
+        self.assertEqual(dataset.flow_cache_misses, 0)
+        self.assertEqual(dataset.flow_cache_hits, 2)
+        self.assertTrue(torch.equal(first["frames"], frames))
         self.assertEqual(int(first["evasion_target"]), IGNORE_INDEX)
         self.assertEqual(int(first["entry_side_target"]), IGNORE_INDEX)
 

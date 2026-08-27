@@ -27,6 +27,7 @@ from blackbox.stages.stage2.dataset_stage2 import (
     Stage2SlidingWindowDataset,
     Stage2VideoRecord,
 )
+from blackbox.preprocessing import DEFAULT_PROCESSED_ROOT
 
 
 ACCEL_LABEL_TO_INDEX = {
@@ -205,7 +206,7 @@ class Stage3SequenceWindowDataset(Dataset):
         stride: int = 32,
         size: int = 224,
         farneback_config: FarnebackConfig = FarnebackConfig(),
-        flow_cache_dir: str | Path | None = DEFAULT_STAGE3_FLOW_CACHE_DIR,
+        processed_root: str | Path = DEFAULT_PROCESSED_ROOT,
     ) -> None:
         if not records:
             raise ValueError("Stage 3 records must not be empty")
@@ -221,7 +222,8 @@ class Stage3SequenceWindowDataset(Dataset):
             size=size,
             include_flow=True,
             farneback_config=farneback_config,
-            flow_cache_dir=flow_cache_dir,
+            processed_root=processed_root,
+            processed_stage="stage3",
         )
 
     @property

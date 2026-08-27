@@ -7,6 +7,7 @@ from pathlib import Path
 from blackbox.stages.stage1 import fit_stage1
 from blackbox.stages.stage2 import fit_stage2
 from blackbox.stages.stage3 import fit_stage3
+from blackbox.preprocessing import DEFAULT_PROCESSED_ROOT
 from blackbox.training_control import TrainingControlConfig
 
 
@@ -21,7 +22,11 @@ def train_baseline(
     stage1_focal_gamma: float = 2.0,
     stage1_augmentation: bool = True,
     stage1_tta_slots: int = 3,
+    stage1_size: int = 224,
+    stage1_frames: int = 16,
+    stage1_batch_size: int = 1,
     training_control: TrainingControlConfig = TrainingControlConfig(),
+    processed_root: str | Path = DEFAULT_PROCESSED_ROOT,
 ) -> list[Path]:
     data = Path(data_root)
     model = Path(model_root)
@@ -34,9 +39,13 @@ def train_baseline(
                 epochs=epochs,
                 feature_mode=stage1_feature_mode,
                 focal_gamma=stage1_focal_gamma,
+                size=stage1_size,
+                frames=stage1_frames,
+                batch_size=stage1_batch_size,
                 enable_augmentation=stage1_augmentation,
                 inference_tta_slots=stage1_tta_slots,
                 training_control=training_control,
+                processed_root=processed_root,
             )
         )
     if 2 in stages:

@@ -9,12 +9,14 @@ from pathlib import Path
 from blackbox.data_validation import validate_public_example
 from blackbox.training import train_baseline
 from blackbox.training_control import TrainingControlConfig
+from blackbox.preprocessing import DEFAULT_PROCESSED_ROOT
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--model-root", type=Path, required=True)
+    parser.add_argument("--processed-root", type=Path, default=DEFAULT_PROCESSED_ROOT)
     parser.add_argument("--stages", type=int, nargs="+", choices=[1, 2, 3], default=[1, 2, 3])
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--pretrained-stage2", action="store_true")
@@ -41,6 +43,9 @@ def main() -> int:
         default=3,
         help="Number of early/middle/late temporal samples averaged for Stage 1 inference.",
     )
+    parser.add_argument("--stage1-size", type=int, default=224)
+    parser.add_argument("--stage1-frames", type=int, default=16)
+    parser.add_argument("--stage1-batch-size", type=int, default=1)
     parser.add_argument("--min-learning-rate", type=float, default=1e-6)
     parser.add_argument("--early-stopping-patience", type=int, default=5)
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
@@ -65,6 +70,9 @@ def main() -> int:
         stage1_focal_gamma=args.stage1_focal_gamma,
         stage1_augmentation=not args.stage1_no_augmentation,
         stage1_tta_slots=args.stage1_tta_slots,
+        stage1_size=args.stage1_size,
+        stage1_frames=args.stage1_frames,
+        stage1_batch_size=args.stage1_batch_size,
         training_control=TrainingControlConfig(
             min_learning_rate=args.min_learning_rate,
             early_stopping_patience=args.early_stopping_patience,
@@ -72,6 +80,7 @@ def main() -> int:
             validation_fraction=args.validation_fraction,
             log_dir=args.log_dir,
         ),
+        processed_root=args.processed_root,
     )
     for artifact in artifacts:
         print(f"[OK] {artifact} ({artifact.stat().st_size / 1024**2:.1f} MiB)")

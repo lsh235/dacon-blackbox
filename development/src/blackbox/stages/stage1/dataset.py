@@ -13,6 +13,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as transform_functional
 
 from blackbox.common.runtime import S1_MEAN, S1_STD
+from blackbox.preprocessing import DEFAULT_PROCESSED_ROOT, load_stage1_feature
 
 
 RGB_FEATURES = "rgb"
@@ -148,6 +149,28 @@ class Stage1TrainAugmentation:
             "max_degrees": self.max_degrees,
             "max_translate": self.max_translate,
         }
+
+    def apply_cached_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Keep runtime augmentation while reading precomputed FFT tensors.
+
+        The RGB channels are temporarily restored to ``[0, 1]``, augmented by
+        the existing clip-consistent policy, then normalized again.  Cached
+        FFT channels intentionally stay fixed: recalculating a 2-D FFT after
+        every augmentation would reintroduce the CPU/GPU pipeline bottleneck
+        this offline path is designed to remove.
+        """
+
+        if features.ndim != 4 or features.shape[0] not in (3, 6):
+            raise ValueError(
+                "cached features must have shape [3 or 6, time, height, width], "
+                f"got {tuple(features.shape)}"
+            )
+        mean = S1_MEAN.to(device=features.device, dtype=features.dtype)
+        std = S1_STD.to(device=features.device, dtype=features.dtype)
+        rgb = (features[:3] * std + mean).clamp(0.0, 1.0)
+        augmented_rgb = self(rgb)
+        normalized = (augmented_rgb - mean) / std
+        return normalized if features.shape[0] == 3 else torch.cat((normalized, features[3:]), dim=0)
 
 
 def feature_channels(feature_mode: str) -> int:
@@ -298,7 +321,7 @@ def decode_uniform_clip(
 
 
 class Stage1TrainingDataset(Dataset):
-    """Labeled, fixed-frame Stage 1 clips with bounded host-memory use."""
+    """Labeled Stage 1 clips loaded only from offline ``.npy`` features."""
 
     def __init__(
         self,
@@ -309,6 +332,7 @@ class Stage1TrainingDataset(Dataset):
         feature_mode: str,
         slots: int = 1,
         augmentation: Stage1TrainAugmentation | None = None,
+        processed_root: str | Path = DEFAULT_PROCESSED_ROOT,
     ) -> None:
         if not samples:
             raise ValueError("Stage 1 training samples must not be empty")
@@ -324,6 +348,7 @@ class Stage1TrainingDataset(Dataset):
         self.feature_mode = feature_mode
         self.slots = slots
         self.augmentation = augmentation
+        self.processed_root = Path(processed_root)
 
     def __len__(self) -> int:
         return len(self.samples) * self.slots
@@ -331,16 +356,19 @@ class Stage1TrainingDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
         video_index, slot = divmod(index, self.slots)
         path, label = self.samples[video_index]
-        rgb_clip = decode_uniform_clip(
+        features = load_stage1_feature(
+            self.processed_root,
             path,
             size=self.size,
             frames=self.frames,
             slot=slot,
             slots=self.slots,
+            feature_mode=self.feature_mode,
+            channels=feature_channels(self.feature_mode),
         )
         if self.augmentation is not None:
-            rgb_clip = self.augmentation(rgb_clip)
-        return prepare_stage1_features(rgb_clip, self.feature_mode), label
+            features = self.augmentation.apply_cached_features(features)
+        return features, label
 
 
 class Stage1InferenceDataset(Dataset):

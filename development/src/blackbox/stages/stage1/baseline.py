@@ -23,6 +23,7 @@ from blackbox.common.runtime import (
     video_paths,
 )
 from blackbox.contracts import validate_prediction_frame
+from blackbox.preprocessing import DEFAULT_PROCESSED_ROOT
 from blackbox.training_control import (
     EarlyStopping,
     JsonlTrainingLogger,
@@ -101,6 +102,7 @@ def fit_stage1(
     inference_tta_slots: int = DEFAULT_TTA_SLOTS,
     label_frame: pd.DataFrame | None = None,
     training_control: TrainingControlConfig = TrainingControlConfig(),
+    processed_root: str | Path = DEFAULT_PROCESSED_ROOT,
 ) -> Path:
     if epochs < 0:
         raise ValueError("epochs must be >= 0")
@@ -146,6 +148,7 @@ def fit_stage1(
         frames=frames,
         feature_mode=feature_mode,
         augmentation=augmentation,
+        processed_root=processed_root,
     )
     generator = torch.Generator().manual_seed(seed)
     loader = DataLoader(
@@ -163,6 +166,7 @@ def fit_stage1(
                 frames=frames,
                 feature_mode=feature_mode,
                 augmentation=None,
+                processed_root=processed_root,
             ),
             batch_size=batch_size,
             shuffle=False,
