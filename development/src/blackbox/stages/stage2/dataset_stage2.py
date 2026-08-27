@@ -8,9 +8,13 @@ This module therefore returns both local targets and their source-frame map.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import hashlib
+import json
+import os
 from pathlib import Path
 from typing import Sequence
+from uuid import uuid4
 
 import cv2
 import numpy as np
@@ -21,6 +25,34 @@ from torch.utils.data import Dataset
 
 IGNORE_INDEX = -100
 ENTRY_SIDE_TO_INDEX = {"LEFT": 0, "RIGHT": 1}
+FLOW_CACHE_SCHEMA = "stage2-farneback-v1"
+DEFAULT_OPTICAL_FLOW_CACHE_DIR = (
+    Path(__file__).resolve().parents[4] / "artifacts" / "features" / "stage2" / "optical_flow"
+)
+
+
+@dataclass(frozen=True)
+class FarnebackConfig:
+    """Fixed, checkpointable OpenCV Farneback settings for Stage 2 flow."""
+
+    pyr_scale: float = 0.5
+    levels: int = 3
+    winsize: int = 15
+    iterations: int = 3
+    poly_n: int = 5
+    poly_sigma: float = 1.2
+    flags: int = 0
+    flow_clip: float = 20.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.pyr_scale < 1.0:
+            raise ValueError("Farneback pyr_scale must be in (0, 1)")
+        if self.levels < 1 or self.winsize < 1 or self.iterations < 1:
+            raise ValueError("Farneback levels, winsize, and iterations must be >= 1")
+        if self.poly_n < 3 or self.poly_n % 2 == 0:
+            raise ValueError("Farneback poly_n must be an odd integer >= 3")
+        if self.poly_sigma <= 0.0 or self.flow_clip <= 0.0:
+            raise ValueError("Farneback poly_sigma and flow_clip must be > 0")
 
 
 @dataclass(frozen=True)
@@ -46,6 +78,7 @@ class Stage2Window:
     record: Stage2VideoRecord
     start_frame: int
     end_frame: int
+    flow_cache_key: str | None = None
 
 
 def _optional_integer(value: object, *, field: str, allowed: set[int] | None = None) -> int:
@@ -157,6 +190,125 @@ def _resize_center_crop(rgb: np.ndarray, size: int) -> torch.Tensor:
     return torch.from_numpy(crop).permute(2, 0, 1).float() / 255.0
 
 
+def farneback_optical_flow(
+    frames: torch.Tensor,
+    *,
+    valid_length: int,
+    config: FarnebackConfig = FarnebackConfig(),
+) -> torch.Tensor:
+    """Return normalized ``[T, 2, H, W]`` (dx, dy) flow for one RGB chunk.
+
+    The input has already passed through the exact resize/center-crop path used
+    by the RGB stream.  Padded tail positions are deliberately zero rather than
+    carrying a repeated-last-frame flow into the model.
+    """
+
+    if frames.ndim != 4 or frames.shape[1] != 3:
+        raise ValueError(f"frames must have shape [time, 3, height, width], got {tuple(frames.shape)}")
+    time, _, height, width = frames.shape
+    if not 1 <= valid_length <= time:
+        raise ValueError("valid_length must be in [1, time]")
+
+    # Dataset tensors are CPU tensors, but keeping this helper defensive makes
+    # its deterministic output usable in isolated tests as well.
+    rgb = (
+        frames.detach()
+        .to(device="cpu", dtype=torch.float32)
+        .clamp(0.0, 1.0)
+        .mul(255.0)
+        .round()
+        .to(dtype=torch.uint8)
+        .permute(0, 2, 3, 1)
+        .contiguous()
+        .numpy()
+    )
+    flow = np.zeros((time, 2, height, width), dtype=np.float32)
+    previous = cv2.cvtColor(rgb[0], cv2.COLOR_RGB2GRAY)
+    for local_index in range(1, valid_length):
+        current = cv2.cvtColor(rgb[local_index], cv2.COLOR_RGB2GRAY)
+        dense = cv2.calcOpticalFlowFarneback(
+            previous,
+            current,
+            None,
+            config.pyr_scale,
+            config.levels,
+            config.winsize,
+            config.iterations,
+            config.poly_n,
+            config.poly_sigma,
+            config.flags,
+        )
+        # OpenCV returns [..., (dx, dy)]; use the documented channel order.
+        flow[local_index] = np.moveaxis(dense, -1, 0)
+        previous = current
+    np.clip(flow, -config.flow_clip, config.flow_clip, out=flow)
+    flow /= config.flow_clip
+    return torch.from_numpy(flow)
+
+
+def _video_content_hash(path: Path) -> str:
+    """Hash source bytes once per video so a changed video cannot reuse flow."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while block := handle.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def flow_cache_key(
+    *,
+    video_hash: str,
+    start_frame: int,
+    end_frame: int,
+    window_frames: int,
+    size: int,
+    config: FarnebackConfig,
+) -> str:
+    """Build a stale-safe cache key without including label-derived values."""
+
+    payload = {
+        "schema": FLOW_CACHE_SCHEMA,
+        "video_sha256": video_hash,
+        "original_frame_range": [start_frame, end_frame],
+        "window_frames": window_frames,
+        "resize_crop": {"policy": "resize_shorter_side_then_center_crop", "size": size},
+        "farneback": asdict(config),
+        "opencv_version": cv2.__version__,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _load_flow_cache(path: Path, *, expected_shape: tuple[int, int, int, int]) -> torch.Tensor | None:
+    try:
+        cached = np.load(path, allow_pickle=False)
+    except (OSError, ValueError):
+        return None
+    if (
+        cached.shape != expected_shape
+        or cached.dtype != np.float32
+        or not np.isfinite(cached).all()
+        or np.abs(cached).max(initial=0.0) > 1.00001
+    ):
+        return None
+    return torch.from_numpy(np.ascontiguousarray(cached.copy()))
+
+
+def _store_flow_cache(path: Path, flow: torch.Tensor) -> None:
+    """Atomically publish a cache file so DataLoader workers may race safely."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            np.save(handle, flow.detach().cpu().numpy().astype(np.float32, copy=False), allow_pickle=False)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def decode_stage2_window(
     path: str | Path,
     *,
@@ -217,6 +369,9 @@ class Stage2SlidingWindowDataset(Dataset):
         window_frames: int = 64,
         stride: int = 32,
         size: int = 224,
+        include_flow: bool = True,
+        farneback_config: FarnebackConfig = FarnebackConfig(),
+        flow_cache_dir: str | Path | None = DEFAULT_OPTICAL_FLOW_CACHE_DIR,
     ) -> None:
         if not records:
             raise ValueError("Stage 2 records must not be empty")
@@ -224,15 +379,38 @@ class Stage2SlidingWindowDataset(Dataset):
             raise ValueError("window_frames, stride, and size must be >= 1")
         self.window_frames = window_frames
         self.size = size
+        self.include_flow = include_flow
+        self.farneback_config = farneback_config
+        self.flow_cache_dir = None if flow_cache_dir is None else Path(flow_cache_dir)
         self.windows: list[Stage2Window] = []
+        # These counters are intentionally process-local.  They make the
+        # single-worker smoke run observable; multi-worker production metrics
+        # should be collected from worker logs instead.
+        self.flow_cache_hits = 0
+        self.flow_cache_misses = 0
+        video_hashes: dict[Path, str] = {}
         for record in records:
             total_frames = video_frame_count(record.video_path)
+            if include_flow and self.flow_cache_dir is not None:
+                video_hashes[record.video_path] = _video_content_hash(record.video_path)
             for start_frame in sliding_window_starts(total_frames, window_frames, stride):
+                end_frame = min(start_frame + window_frames, total_frames)
+                cache_key = None
+                if include_flow and self.flow_cache_dir is not None:
+                    cache_key = flow_cache_key(
+                        video_hash=video_hashes[record.video_path],
+                        start_frame=start_frame,
+                        end_frame=end_frame,
+                        window_frames=window_frames,
+                        size=size,
+                        config=farneback_config,
+                    )
                 self.windows.append(
                     Stage2Window(
                         record=record,
                         start_frame=start_frame,
-                        end_frame=min(start_frame + window_frames, total_frames),
+                        end_frame=end_frame,
+                        flow_cache_key=cache_key,
                     )
                 )
 
@@ -249,7 +427,7 @@ class Stage2SlidingWindowDataset(Dataset):
         )
         frame_numbers = torch.arange(window.start_frame, window.start_frame + self.window_frames)
         frame_numbers[valid_length:] = window.start_frame + valid_length - 1
-        return {
+        sample: dict[str, object] = {
             "id": window.record.video_id,
             "frames": frames,
             "valid_length": torch.tensor(valid_length, dtype=torch.long),
@@ -270,9 +448,41 @@ class Stage2SlidingWindowDataset(Dataset):
                 ),
                 dtype=torch.long,
             ),
-            "evasion_target": torch.tensor(window.record.evasion_space, dtype=torch.long),
-            "entry_side_target": torch.tensor(window.record.entry_side, dtype=torch.long),
+            "evasion_target": torch.tensor(
+                window.record.evasion_space
+                if window.record.evasion_space >= 0
+                else IGNORE_INDEX,
+                dtype=torch.long,
+            ),
+            "entry_side_target": torch.tensor(
+                window.record.entry_side if window.record.entry_side >= 0 else IGNORE_INDEX,
+                dtype=torch.long,
+            ),
         }
+        if self.include_flow:
+            flow_cache_hit = False
+            cache_path = (
+                None
+                if self.flow_cache_dir is None or window.flow_cache_key is None
+                else self.flow_cache_dir / f"{window.flow_cache_key}.npy"
+            )
+            expected_shape = (self.window_frames, 2, self.size, self.size)
+            flow = None if cache_path is None else _load_flow_cache(cache_path, expected_shape=expected_shape)
+            if flow is None:
+                flow = farneback_optical_flow(
+                    frames,
+                    valid_length=valid_length,
+                    config=self.farneback_config,
+                )
+                self.flow_cache_misses += 1
+                if cache_path is not None:
+                    _store_flow_cache(cache_path, flow)
+            else:
+                flow_cache_hit = True
+                self.flow_cache_hits += 1
+            sample["flow"] = flow
+            sample["flow_cache_hit"] = torch.tensor(flow_cache_hit, dtype=torch.bool)
+        return sample
 
 
 def collate_stage2_windows(samples: Sequence[dict[str, object]]) -> dict[str, object]:
@@ -280,7 +490,7 @@ def collate_stage2_windows(samples: Sequence[dict[str, object]]) -> dict[str, ob
 
     if not samples:
         raise ValueError("cannot collate an empty Stage 2 batch")
-    tensor_keys = (
+    tensor_keys = [
         "frames",
         "valid_length",
         "frame_numbers",
@@ -288,7 +498,9 @@ def collate_stage2_windows(samples: Sequence[dict[str, object]]) -> dict[str, ob
         "entry_target",
         "evasion_target",
         "entry_side_target",
-    )
+    ]
+    if all("flow" in sample for sample in samples):
+        tensor_keys.extend(["flow", "flow_cache_hit"])
     return {
         "id": [str(sample["id"]) for sample in samples],
         **{key: torch.stack([sample[key] for sample in samples]) for key in tensor_keys},
