@@ -7,7 +7,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import torch
-from torch.nn import functional as functional
 from torch.utils.data import DataLoader
 
 from blackbox.common.runtime import (
@@ -29,12 +28,15 @@ from blackbox.stages.stage3.dataset_stage3 import (
 from blackbox.preprocessing import DEFAULT_PROCESSED_ROOT
 from blackbox.experiment_config import config_path_value, load_experiment_config, section, stage_paths
 from blackbox.stages.stage3.model_stage3 import Stage3TwoStreamBiLSTM
+from blackbox.stages.stage1.losses import FocalLoss
+from blackbox.stages.two_stream import DEFAULT_FLOW_PHYSICS_FEATURES
 from blackbox.training_control import (
     EarlyStopping,
     JsonlTrainingLogger,
     TrainingControlConfig,
     cosine_scheduler,
     group_holdout_indices,
+    macro_f1_score,
 )
 
 
@@ -47,23 +49,55 @@ class Stage3TwoStreamTrainingConfig:
     size: int = 224
     batch_size: int = 1
     frame_batch_size: int = 8
+    hidden_size: int = 192
+    layers: int = 2
     learning_rate: float = 2e-4
+    focal_gamma: float = 0.0
     num_workers: int = 0
+    flow_roi_top_ratio: float = 0.5
+    flow_roi_mode: str = "mask"
+    flow_grid_size: int = 3
+    flow_projection_dim: int = 512
+    use_physics_vector: bool = False
+    physics_features: tuple[str, ...] = DEFAULT_FLOW_PHYSICS_FEATURES
+    physics_projection_dim: int = 32
     processed_root: str | Path = DEFAULT_PROCESSED_ROOT
     farneback: FarnebackConfig = FarnebackConfig()
     training_control: TrainingControlConfig = TrainingControlConfig()
 
     def __post_init__(self) -> None:
-        if min(self.window_frames, self.stride, self.size, self.batch_size, self.frame_batch_size) < 1:
-            raise ValueError("window, stride, size, batch size, and frame batch size must be >= 1")
-        if self.learning_rate <= 0.0 or self.num_workers < 0:
-            raise ValueError("learning_rate must be > 0 and num_workers must be >= 0")
+        if min(
+            self.window_frames,
+            self.stride,
+            self.size,
+            self.batch_size,
+            self.frame_batch_size,
+            self.hidden_size,
+            self.layers,
+        ) < 1:
+            raise ValueError("window, stride, size, batch, hidden, and layer values must be >= 1")
+        if self.learning_rate <= 0.0 or self.num_workers < 0 or self.focal_gamma < 0.0:
+            raise ValueError("learning_rate must be > 0; num_workers and focal_gamma must be >= 0")
+        if not 0.0 <= self.flow_roi_top_ratio < 1.0:
+            raise ValueError("flow_roi_top_ratio must be in [0, 1)")
+        if self.flow_roi_mode != "mask":
+            raise ValueError("flow_roi_mode must be 'mask'")
+        if min(self.flow_grid_size, self.flow_projection_dim, self.physics_projection_dim) < 1:
+            raise ValueError("Flow grid and projection dimensions must be >= 1")
+        if not self.physics_features:
+            raise ValueError("physics_features must not be empty")
 
 
-def stage3_sequence_loss(predictions: dict[str, torch.Tensor], batch: dict[str, object]) -> torch.Tensor | None:
-    """Cross entropy only at sparse 0.1-second positions that have labels."""
+def stage3_sequence_loss(
+    predictions: dict[str, torch.Tensor],
+    batch: dict[str, object],
+    *,
+    focal_gamma: float = 0.0,
+) -> torch.Tensor | None:
+    """Focal loss only at sparse 0.1-second positions that have labels."""
 
     terms: list[torch.Tensor] = []
+    criterion = FocalLoss(gamma=focal_gamma)
     for logits_key, targets_key in (("accel_logits", "accel_targets"), ("steer_logits", "steer_targets")):
         targets = batch[targets_key]
         logits = predictions[logits_key]
@@ -71,11 +105,11 @@ def stage3_sequence_loss(predictions: dict[str, torch.Tensor], batch: dict[str, 
             raise TypeError(f"{targets_key} must be a tensor")
         available = targets != IGNORE_INDEX
         if bool(available.any()):
-            terms.append(functional.cross_entropy(logits[available], targets[available]))
+            terms.append(criterion(logits[available], targets[available]))
     return torch.stack(terms).mean() if terms else None
 
 
-def _run_epoch(
+def run_stage3_epoch(
     model: Stage3TwoStreamBiLSTM,
     loader: DataLoader,
     *,
@@ -83,6 +117,7 @@ def _run_epoch(
     optimizer: torch.optim.Optimizer | None,
     scaler: torch.amp.GradScaler | None,
     use_amp: bool,
+    focal_gamma: float,
 ) -> float | None:
     training = optimizer is not None
     model.train(training)
@@ -102,7 +137,11 @@ def _run_epoch(
                     tensor_batch["flow"],
                     tensor_batch["valid_length"],
                 )
-                loss = stage3_sequence_loss(predictions, tensor_batch)
+                loss = stage3_sequence_loss(
+                    predictions,
+                    tensor_batch,
+                    focal_gamma=focal_gamma,
+                )
             if loss is None:
                 continue
             if optimizer is not None:
@@ -115,6 +154,50 @@ def _run_epoch(
     return sum(losses) / len(losses) if losses else None
 
 
+def evaluate_stage3_macro_f1(
+    model: Stage3TwoStreamBiLSTM,
+    loader: DataLoader,
+    *,
+    device: torch.device,
+    use_amp: bool,
+) -> float | None:
+    """Return the mean of acceleration and steering Macro F1 on sparse labels."""
+
+    model.eval()
+    accel_targets: list[int] = []
+    accel_predictions: list[int] = []
+    steer_targets: list[int] = []
+    steer_predictions: list[int] = []
+    with torch.inference_mode():
+        for batch in loader:
+            tensor_batch = {
+                key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
+                for key, value in batch.items()
+            }
+            with autocast_context(device, enabled=use_amp):
+                predictions = model(
+                    tensor_batch["frames"],
+                    tensor_batch["flow"],
+                    tensor_batch["valid_length"],
+                )
+            for logits_key, targets_key, expected, actual in (
+                ("accel_logits", "accel_targets", accel_targets, accel_predictions),
+                ("steer_logits", "steer_targets", steer_targets, steer_predictions),
+            ):
+                targets = tensor_batch[targets_key]
+                available = targets != IGNORE_INDEX
+                if bool(available.any()):
+                    expected.extend(targets[available].detach().cpu().tolist())
+                    actual.extend(
+                        predictions[logits_key][available].argmax(dim=1).detach().cpu().tolist()
+                    )
+    if not accel_targets or not steer_targets:
+        return None
+    accel_f1 = macro_f1_score(accel_targets, accel_predictions, labels=range(4))
+    steer_f1 = macro_f1_score(steer_targets, steer_predictions, labels=range(3))
+    return (accel_f1 + steer_f1) / 2.0
+
+
 def fit_stage3_two_stream_skeleton(
     data_dir: str | Path,
     model_dir: str | Path,
@@ -123,7 +206,7 @@ def fit_stage3_two_stream_skeleton(
     seed: int = DEFAULT_SEED,
     config: Stage3TwoStreamTrainingConfig = Stage3TwoStreamTrainingConfig(),
 ) -> Path:
-    """Train the metadata-derived 10 Hz research model and save its checkpoint."""
+    """Train the source-grounded 10 Hz research model and save its checkpoint."""
 
     if epochs < 0:
         raise ValueError("epochs must be >= 0")
@@ -176,7 +259,18 @@ def fit_stage3_two_stream_skeleton(
         if valid_dataset is not None
         else None
     )
-    model = Stage3TwoStreamBiLSTM(frame_batch_size=config.frame_batch_size).to(device)
+    model = Stage3TwoStreamBiLSTM(
+        hidden_size=config.hidden_size,
+        layers=config.layers,
+        frame_batch_size=config.frame_batch_size,
+        flow_grid_size=config.flow_grid_size,
+        flow_roi_top_ratio=config.flow_roi_top_ratio,
+        flow_roi_mode=config.flow_roi_mode,
+        flow_projection_dim=config.flow_projection_dim,
+        use_physics_vector=config.use_physics_vector,
+        physics_features=config.physics_features,
+        physics_projection_dim=config.physics_projection_dim,
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     scaler = make_grad_scaler(device, enabled=config.training_control.use_amp)
     scheduler = cosine_scheduler(
@@ -186,35 +280,34 @@ def fit_stage3_two_stream_skeleton(
     )
     logger = JsonlTrainingLogger("stage3_two_stream", config.training_control.log_dir)
     early_stopping = EarlyStopping(
-        mode="min",
+        mode="max" if valid_loader is not None else "min",
         patience=config.training_control.early_stopping_patience,
         min_delta=config.training_control.early_stopping_min_delta,
     )
     for epoch in range(epochs):
-        average_loss = _run_epoch(
+        average_loss = run_stage3_epoch(
             model,
             train_loader,
             device=device,
             optimizer=optimizer,
             scaler=scaler,
             use_amp=config.training_control.use_amp,
+            focal_gamma=config.focal_gamma,
         )
         if average_loss is None:
             raise ValueError("Stage 3 Two-Stream training found no sparse targets in its windows")
         valid_metric = (
-            _run_epoch(
+            evaluate_stage3_macro_f1(
                 model,
                 valid_loader,
                 device=device,
-                optimizer=None,
-                scaler=None,
                 use_amp=config.training_control.use_amp,
             )
             if valid_loader
             else None
         )
         learning_rate = float(optimizer.param_groups[0]["lr"])
-        monitor_name = "valid_sparse_ce_group_holdout" if valid_metric is not None else "train_loss_proxy_no_validation"
+        monitor_name = "valid_motion_macro_f1_group_holdout" if valid_metric is not None else "train_loss_proxy_no_validation"
         monitor_value = valid_metric if valid_metric is not None else average_loss
         logger.log(
             epoch=epoch + 1,
@@ -226,7 +319,7 @@ def fit_stage3_two_stream_skeleton(
         )
         print(
             f"[Stage3 Two-Stream][epoch {epoch + 1}/{epochs}] loss={average_loss:.6f} "
-            f"lr={learning_rate:.3e} valid_sparse_ce="
+            f"lr={learning_rate:.3e} valid_motion_macro_f1="
             f"{'unavailable' if valid_metric is None else f'{valid_metric:.6f}'}"
         )
         scheduler.step()
@@ -239,9 +332,14 @@ def fit_stage3_two_stream_skeleton(
     torch.save(
         {
             "model": model.state_dict(),
-            "format": "experimental_stage3_two_stream_farneback_bilstm_10hz",
+            "format": "experimental_stage3_two_stream_ego_motion_v2_10hz",
+            "architecture": model.architecture_metadata(),
             "config": asdict(config),
-            "time_axis": "round(cv2.CAP_PROP_FPS / 10) per video",
+            "time_axis": {
+                "evaluation": "one decoded 10Hz frame per sample_index",
+                "sparse_public_training": "round(median(frame_index / sample_index))",
+                "cap_prop_fps": "diagnostic_only",
+            },
             "amp": {
                 "requested": config.training_control.use_amp,
                 "enabled": scaler.is_enabled(),
@@ -272,6 +370,17 @@ def main() -> int:
     parser.add_argument("--size", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--frame-batch-size", type=int)
+    parser.add_argument("--hidden-size", type=int)
+    parser.add_argument("--layers", type=int)
+    parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--focal-gamma", type=float)
+    parser.add_argument("--flow-roi-top-ratio", type=float)
+    parser.add_argument("--flow-roi-mode", choices=("mask",))
+    parser.add_argument("--flow-grid-size", type=int)
+    parser.add_argument("--flow-projection-dim", type=int)
+    parser.add_argument("--use-physics-vector", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--physics-features", nargs="+")
+    parser.add_argument("--physics-projection-dim", type=int)
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--processed-root", type=Path)
     args = parser.parse_args()
@@ -323,8 +432,18 @@ def main() -> int:
                 size=args.size if args.size is not None else int(stage.get("size", 224)),
                 batch_size=args.batch_size if args.batch_size is not None else int(stage.get("batch_size", 1)),
                 frame_batch_size=args.frame_batch_size if args.frame_batch_size is not None else int(stage.get("frame_batch_size", 8)),
-                learning_rate=float(stage.get("learning_rate", 2e-4)),
+                hidden_size=args.hidden_size if args.hidden_size is not None else int(stage.get("hidden_size", 192)),
+                layers=args.layers if args.layers is not None else int(stage.get("layers", 2)),
+                learning_rate=args.learning_rate if args.learning_rate is not None else float(stage.get("learning_rate", 2e-4)),
+                focal_gamma=args.focal_gamma if args.focal_gamma is not None else float(stage.get("focal_gamma", 0.0)),
                 num_workers=args.num_workers if args.num_workers is not None else int(stage.get("num_workers", 0)),
+                flow_roi_top_ratio=args.flow_roi_top_ratio if args.flow_roi_top_ratio is not None else float(stage.get("flow_roi_top_ratio", 0.5)),
+                flow_roi_mode=args.flow_roi_mode or str(stage.get("flow_roi_mode", "mask")),
+                flow_grid_size=args.flow_grid_size if args.flow_grid_size is not None else int(stage.get("flow_grid_size", 3)),
+                flow_projection_dim=args.flow_projection_dim if args.flow_projection_dim is not None else int(stage.get("flow_projection_dim", 512)),
+                use_physics_vector=args.use_physics_vector if args.use_physics_vector is not None else bool(stage.get("use_physics_vector", False)),
+                physics_features=tuple(args.physics_features or stage.get("physics_features", DEFAULT_FLOW_PHYSICS_FEATURES)),
+                physics_projection_dim=args.physics_projection_dim if args.physics_projection_dim is not None else int(stage.get("physics_projection_dim", 32)),
                 processed_root=processed_root,
                 training_control=control,
             ),

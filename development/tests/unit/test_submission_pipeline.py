@@ -9,13 +9,13 @@ import pandas as pd
 
 from blackbox.submission_pipeline import (
     generate_submission_bundle,
-    project_stage3_source_frames_by_video_fps,
+    project_stage3_source_frames_by_time_axis,
 )
 from blackbox.stages.stage3.dataset_stage3 import Stage3TimeAxis
 
 
 class SubmissionPipelineTests(unittest.TestCase):
-    def test_stage3_projection_uses_each_videos_fps_derived_stride(self) -> None:
+    def test_stage3_projection_keeps_every_official_10hz_frame(self) -> None:
         source = pd.DataFrame(
             [
                 {
@@ -43,20 +43,22 @@ class SubmissionPipelineTests(unittest.TestCase):
             with patch(
                 "blackbox.submission_pipeline.read_stage3_time_axis",
                 side_effect=[
-                    Stage3TimeAxis(30.0, 3),
-                    Stage3TimeAxis(60.0, 6),
+                    Stage3TimeAxis(30.0, 1, metadata_frames_per_sample=3, mode="official_evaluation_10hz"),
+                    Stage3TimeAxis(60.0, 1, metadata_frames_per_sample=6, mode="official_evaluation_10hz"),
                 ],
             ):
-                projected, axes = project_stage3_source_frames_by_video_fps(
+                projected, axes = project_stage3_source_frames_by_time_axis(
                     source,
                     video_dir=videos,
                 )
         self.assertEqual(projected.groupby("ID")["sample_index"].count().to_dict(), {
-            "S3_30FPS": 2,
-            "S3_60FPS": 2,
+            "S3_30FPS": 6,
+            "S3_60FPS": 12,
         })
-        self.assertEqual(axes["S3_30FPS"]["frames_per_sample"], 3)
-        self.assertEqual(axes["S3_60FPS"]["frames_per_sample"], 6)
+        self.assertEqual(axes["S3_30FPS"]["frames_per_sample"], 1)
+        self.assertEqual(axes["S3_60FPS"]["frames_per_sample"], 1)
+        self.assertEqual(axes["S3_30FPS"]["metadata_frames_per_sample"], 3)
+        self.assertEqual(axes["S3_60FPS"]["metadata_frames_per_sample"], 6)
 
     def test_sequential_pipeline_projects_stage3_and_falls_back_per_failed_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

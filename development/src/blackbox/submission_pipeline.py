@@ -74,7 +74,7 @@ def _stage2_fallback(data_dir: Path) -> pd.DataFrame:
 
 
 def _stage3_stride(path: Path, *, frames_per_sample: int | None) -> tuple[int, dict[str, object]]:
-    """Resolve an explicit override or this video's OpenCV FPS-derived stride."""
+    """Resolve an explicit override or the official one-frame 10 Hz stride."""
 
     if frames_per_sample is not None:
         if frames_per_sample < 1:
@@ -82,8 +82,9 @@ def _stage3_stride(path: Path, *, frames_per_sample: int | None) -> tuple[int, d
         return frames_per_sample, {"mode": "explicit_override", "frames_per_sample": frames_per_sample}
     axis = read_stage3_time_axis(path)
     return axis.frames_per_sample, {
-        "mode": "cap_prop_fps",
+        "mode": axis.mode,
         "source_fps": axis.source_fps,
+        "metadata_frames_per_sample": axis.metadata_frames_per_sample,
         "frames_per_sample": axis.frames_per_sample,
         "label_conflict": axis.has_label_conflict,
     }
@@ -115,9 +116,8 @@ def _stage3_fallback(data_dir: Path, *, frames_per_sample: int | None) -> pd.Dat
 def project_stage3_source_frames(prediction: pd.DataFrame, *, frames_per_sample: int) -> pd.DataFrame:
     """Select source-frame predictions at a caller-specified 0.1-second stride.
 
-    The public material does not reconcile Stage 3 container FPS with its 10Hz
-    index.  ``frames_per_sample`` is therefore an explicit invocation setting,
-    not an implicit inference from video metadata.
+    Official evaluation uses one decoded 10 Hz frame per sample.  This helper
+    remains available only for an explicit diagnostic/source-format override.
     """
 
     if frames_per_sample < 1:
@@ -134,17 +134,16 @@ def project_stage3_source_frames(prediction: pd.DataFrame, *, frames_per_sample:
     return pd.concat(rows, ignore_index=True)[STAGE_COLUMNS["stage3"]]
 
 
-def project_stage3_source_frames_by_video_fps(
+def project_stage3_source_frames_by_time_axis(
     prediction: pd.DataFrame,
     *,
     video_dir: str | Path,
     frames_per_sample: int | None = None,
 ) -> tuple[pd.DataFrame, dict[str, dict[str, object]]]:
-    """Project raw-frame outputs to 10 Hz using one stride per source video.
+    """Project raw-frame outputs using the official Stage 3 time axis.
 
-    An explicit value is retained as a diagnostic/competition override.  In
-    normal operation each video uses ``round(CAP_PROP_FPS / 10)`` so mixed 30
-    and 60 FPS inputs do not share an accidental static stride.
+    Evaluation videos are already 10 Hz, so normal operation retains every
+    decoded frame.  An explicit stride remains available for local diagnostics.
     """
 
     source = validate_prediction_frame("stage3", prediction).copy()
@@ -162,6 +161,11 @@ def project_stage3_source_frames_by_video_fps(
     if not rows:
         return pd.DataFrame(columns=STAGE_COLUMNS["stage3"]), time_axes
     return pd.concat(rows, ignore_index=True)[STAGE_COLUMNS["stage3"]], time_axes
+
+
+# Backward-compatible name for callers written before the official 10 Hz
+# clarification. The implementation no longer derives stride from FPS.
+project_stage3_source_frames_by_video_fps = project_stage3_source_frames_by_time_axis
 
 
 def _expected_ids(stage: int, data_dir: Path) -> set[str]:
@@ -232,6 +236,8 @@ def generate_submission_bundle(
     *,
     stage3_frames_per_sample: int | None = None,
     smoothing_window: int = 1,
+    use_transition_constraints: bool = True,
+    transition_penalty: float = -1e9,
     checkpoint_paths: Mapping[int, Sequence[str | Path]] | None = None,
     sample_submissions: Mapping[int, str | Path] | None = None,
     predictors: Mapping[int, StagePredictor] = DEFAULT_PREDICTORS,
@@ -259,8 +265,14 @@ def generate_submission_bundle(
     summary: dict[str, object] = {
         "fallback_stages": [],
         "stages": {},
-        "stage3_time_axis_mode": "explicit_override" if stage3_frames_per_sample is not None else "cap_prop_fps",
+        "stage3_time_axis_mode": (
+            "explicit_override"
+            if stage3_frames_per_sample is not None
+            else "official_evaluation_10hz"
+        ),
         "stage3_smoothing_window": smoothing_window,
+        "stage3_transition_constraints": use_transition_constraints,
+        "stage3_transition_penalty": transition_penalty,
         "ensemble_checkpoints": {},
     }
 
@@ -287,12 +299,14 @@ def generate_submission_bundle(
                     configured_checkpoints,
                     smoothing_window=smoothing_window,
                     frames_per_sample=stage3_frames_per_sample,
+                    use_transition_constraints=use_transition_constraints,
+                    transition_penalty=transition_penalty,
                 )
             else:
                 prediction = predictors[stage](stage_data, models / stage_name)
             prediction = validate_prediction_frame(stage_name, prediction)
             if stage == 3 and not configured_checkpoints:
-                prediction, time_axes = project_stage3_source_frames_by_video_fps(
+                prediction, time_axes = project_stage3_source_frames_by_time_axis(
                     prediction,
                     video_dir=stage_data / "videos",
                     frames_per_sample=stage3_frames_per_sample,

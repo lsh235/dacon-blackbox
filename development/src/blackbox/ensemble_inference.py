@@ -12,8 +12,14 @@ from blackbox.common.runtime import video_paths
 from blackbox.contracts import validate_prediction_frame
 from blackbox.stages.stage1.baseline import score_stage1_checkpoint
 from blackbox.stages.stage2.baseline import score_stage2_checkpoint, stage2_scores_to_frame
-from blackbox.stages.stage3.baseline import score_stage3_checkpoint, stage3_scores_to_frame
+from blackbox.stages.stage3.baseline import (
+    ACCEL_LABELS,
+    STEER_LABELS,
+    score_stage3_checkpoint,
+    stage3_scores_to_frame,
+)
 from blackbox.stages.stage3.dataset_stage3 import read_stage3_time_axis
+from blackbox.stages.stage3.postprocessing import constrain_stage3_scores
 
 
 def _checkpoints(paths: Sequence[str | Path], *, stage: int) -> list[Path]:
@@ -146,8 +152,9 @@ def _stage3_stride(
         return frames_per_sample, {"mode": "explicit_override", "frames_per_sample": frames_per_sample}
     axis = read_stage3_time_axis(path)
     return axis.frames_per_sample, {
-        "mode": "cap_prop_fps",
+        "mode": axis.mode,
         "source_fps": axis.source_fps,
+        "metadata_frames_per_sample": axis.metadata_frames_per_sample,
         "frames_per_sample": axis.frames_per_sample,
         "label_conflict": axis.has_label_conflict,
     }
@@ -159,8 +166,10 @@ def predict_stage3_ensemble(
     *,
     smoothing_window: int,
     frames_per_sample: int | None,
+    use_transition_constraints: bool = True,
+    transition_penalty: float = -1e9,
 ) -> tuple[pd.DataFrame, dict[str, dict[str, object]]]:
-    """Soft-vote folds, project to 10 Hz, smooth probabilities, then argmax."""
+    """Soft-vote, project, smooth, constrain transitions, then classify."""
 
     checkpoints = _checkpoints(checkpoint_paths, stage=3)
     if smoothing_window < 1 or smoothing_window % 2 == 0:
@@ -202,4 +211,11 @@ def predict_stage3_ensemble(
             smooth_temporal_probabilities(steer, window=smoothing_window),
         )
         time_axes[video_id] = metadata
+    if use_transition_constraints:
+        projected = constrain_stage3_scores(
+            projected,
+            accel_labels=ACCEL_LABELS,
+            steer_labels=STEER_LABELS,
+            forbidden_penalty=transition_penalty,
+        )
     return stage3_scores_to_frame(projected), time_axes

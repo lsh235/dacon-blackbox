@@ -1,10 +1,10 @@
 """Sparse-label 10 Hz windows for the Stage 3 Seq2Seq research path.
 
 RGB frames and dense flow remain spatial tensors until the shared two-stream
-CNN.  Consecutive raw frames are pooled into one 0.1-second step *before* the
-BiLSTM, using each video's OpenCV-reported FPS.  Both source-frame positions
-and supplied sample indices remain in the contract so inconsistent metadata is
-visible instead of silently changing the official output timeline.
+CNN.  Official evaluation videos are already 10 Hz, so one decoded frame is one
+sample.  Sparse public training labels can describe a different source-frame
+spacing; those windows are pooled by the label-derived frame/sample ratio while
+the unreliable OpenCV FPS remains diagnostic metadata only.
 """
 
 from __future__ import annotations
@@ -45,20 +45,23 @@ STAGE3_SAMPLES_PER_SECOND = 10.0
 
 @dataclass(frozen=True)
 class Stage3TimeAxis:
-    """One video's metadata-derived conversion from source frames to 10 Hz."""
+    """One video's official or sparse-training conversion to the 10 Hz grid."""
 
-    source_fps: float
+    source_fps: float | None
     frames_per_sample: int
     label_frames_per_sample: float | None = None
+    metadata_frames_per_sample: int | None = None
+    mode: str = "unspecified"
 
     @property
     def has_label_conflict(self) -> bool:
-        """Whether sparse labels disagree materially with video FPS metadata."""
+        """Whether sparse public labels disagree with container FPS metadata."""
 
         return (
             self.label_frames_per_sample is not None
+            and self.metadata_frames_per_sample is not None
             and not math.isclose(
-                float(self.frames_per_sample),
+                float(self.metadata_frames_per_sample),
                 self.label_frames_per_sample,
                 rel_tol=0.05,
                 abs_tol=0.5,
@@ -82,29 +85,40 @@ def read_stage3_time_axis(
     *,
     annotations: Sequence["Stage3Annotation"] = (),
 ) -> Stage3TimeAxis:
-    """Read FPS through OpenCV and convert it to the nearest 0.1-second chunk.
+    """Resolve the official 10 Hz evaluation or sparse public training axis.
 
-    ``CAP_PROP_FPS`` is intentionally recorded rather than replaced by a
-    dataset-specific constant.  Some supplied public files report metadata
-    that conflicts with their sparse labels; ``has_label_conflict`` lets an
-    experiment reject or audit those rows before treating the conversion as an
-    official inference mapping.
+    DACON confirmed that private evaluation videos are already 10 Hz and have
+    one decoded frame per ``sample_index``.  Public example labels are sparse
+    training annotations and can use a different source-frame spacing, so that
+    spacing is inferred from ``frame_index / sample_index`` when annotations
+    are present.  ``CAP_PROP_FPS`` is retained only to expose broken metadata.
     """
 
     path = Path(video_path)
     capture = cv2.VideoCapture(str(path))
     try:
-        if not capture.isOpened():
-            raise ValueError(f"cannot open Stage 3 video for FPS metadata: {path}")
-        source_fps = float(capture.get(cv2.CAP_PROP_FPS))
+        source_fps = float(capture.get(cv2.CAP_PROP_FPS)) if capture.isOpened() else math.nan
     finally:
         capture.release()
-    if not math.isfinite(source_fps) or source_fps <= 0.0:
-        raise ValueError(f"Stage 3 video has invalid CAP_PROP_FPS={source_fps!r}: {path}")
+    source_fps = source_fps if math.isfinite(source_fps) and source_fps > 0.0 else None
+    metadata_frames_per_sample = (
+        max(1, round(source_fps / STAGE3_SAMPLES_PER_SECOND))
+        if source_fps is not None
+        else None
+    )
+    label_frames_per_sample = infer_label_frames_per_sample(annotations)
+    if label_frames_per_sample is not None:
+        frames_per_sample = max(1, round(label_frames_per_sample))
+        mode = "sparse_public_label_mapping"
+    else:
+        frames_per_sample = 1
+        mode = "official_evaluation_10hz"
     return Stage3TimeAxis(
         source_fps=source_fps,
-        frames_per_sample=max(1, round(source_fps / STAGE3_SAMPLES_PER_SECOND)),
-        label_frames_per_sample=infer_label_frames_per_sample(annotations),
+        frames_per_sample=frames_per_sample,
+        label_frames_per_sample=label_frames_per_sample,
+        metadata_frames_per_sample=metadata_frames_per_sample,
+        mode=mode,
     )
 
 
@@ -196,7 +210,7 @@ def read_stage3_records(data_dir: str | Path) -> list[Stage3VideoRecord]:
 
 
 class Stage3SequenceWindowDataset(Dataset):
-    """Convert cached raw RGB+flow windows into metadata-derived 10 Hz steps."""
+    """Convert cached raw RGB+flow windows into source-grounded 10 Hz steps."""
 
     def __init__(
         self,
@@ -331,7 +345,10 @@ class Stage3SequenceWindowDataset(Dataset):
             "sample_indices": sample_indices,
             "accel_targets": accel_targets,
             "steer_targets": steer_targets,
-            "source_fps": torch.tensor(time_axis.source_fps, dtype=torch.float32),
+            "source_fps": torch.tensor(
+                time_axis.source_fps if time_axis.source_fps is not None else float("nan"),
+                dtype=torch.float32,
+            ),
             "frames_per_sample": torch.tensor(time_axis.frames_per_sample, dtype=torch.long),
             "time_axis_conflict": torch.tensor(time_axis.has_label_conflict, dtype=torch.bool),
         }

@@ -35,6 +35,7 @@ from blackbox.training_control import (
     group_holdout_indices,
     macro_f1_score,
 )
+from blackbox.stages.stage3.postprocessing import constrain_stage3_scores
 
 
 ACCEL_LABELS = ["ACCELERATING", "DECELERATING", "CONSTANT", "STOPPED"]
@@ -288,4 +289,9 @@ def stage3_scores_to_frame(
 
 def predict_stage3(data_dir, model_dir):
     scores = score_stage3_checkpoint(data_dir, Path(model_dir) / "best.pt")
-    return stage3_scores_to_frame(scores)
+    constrained = constrain_stage3_scores(
+        scores,
+        accel_labels=ACCEL_LABELS,
+        steer_labels=STEER_LABELS,
+    )
+    return stage3_scores_to_frame(constrained)

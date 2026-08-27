@@ -46,11 +46,18 @@ def main() -> int:
         help="Positive odd moving-average window on projected Stage 3 probabilities",
     )
     parser.add_argument(
+        "--use-transition-constraints",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply physics-aware Viterbi transition constraints to Stage 3",
+    )
+    parser.add_argument("--transition-penalty", type=float)
+    parser.add_argument(
         "--stage3-frames-per-sample",
         type=int,
         help=(
             "Optional override for the source-frame count per Stage 3 0.1-second sample. "
-            "Default: use round(cv2.CAP_PROP_FPS / 10) for each video."
+            "Default: retain every decoded frame from the official 10 Hz evaluation video."
         ),
     )
     parser.add_argument("--stage1-sample-submission", type=Path)
@@ -117,6 +124,16 @@ def main() -> int:
         if args.smoothing_window is not None
         else int(inference.get("smoothing_window", 1))
     )
+    use_transition_constraints = (
+        args.use_transition_constraints
+        if args.use_transition_constraints is not None
+        else bool(inference.get("use_transition_constraints", True))
+    )
+    transition_penalty = (
+        args.transition_penalty
+        if args.transition_penalty is not None
+        else float(inference.get("transition_penalty", -1e9))
+    )
     sample_submissions = {
         stage: path
         for stage, path in (
@@ -132,6 +149,8 @@ def main() -> int:
         output_root,
         stage3_frames_per_sample=None if frames_per_sample is None else int(frames_per_sample),
         smoothing_window=smoothing_window,
+        use_transition_constraints=use_transition_constraints,
+        transition_penalty=transition_penalty,
         checkpoint_paths={stage: paths for stage, paths in checkpoint_paths.items() if paths},
         sample_submissions=sample_submissions,
     )

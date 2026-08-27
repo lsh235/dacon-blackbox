@@ -46,8 +46,18 @@ stage3:
   size: 224
   batch_size: 1
   frame_batch_size: 8
+  hidden_size: 192
+  layers: 2
   learning_rate: 0.0002
+  focal_gamma: 0.0
   frames_per_sample: null
+  flow_roi_top_ratio: 0.5
+  flow_roi_mode: mask
+  flow_grid_size: 3
+  flow_projection_dim: 512
+  use_physics_vector: false
+  physics_features: [mean_dx, mean_dy, std_dx, std_dy]
+  physics_projection_dim: 32
 
 preprocessing:
   stage1_slots: 1
@@ -55,6 +65,8 @@ preprocessing:
 
 inference:
   smoothing_window: 3
+  use_transition_constraints: true
+  transition_penalty: -1000000000.0
   checkpoints:
     stage1: []
     stage2: []

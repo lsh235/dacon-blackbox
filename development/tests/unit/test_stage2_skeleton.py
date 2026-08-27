@@ -124,6 +124,19 @@ class Stage2SlidingWindowTests(unittest.TestCase):
 
 
 class Stage2SequenceModelTests(unittest.TestCase):
+    def test_default_two_stream_state_dict_strictly_reloads_legacy_shapes(self) -> None:
+        model = Stage2TwoStreamBiLSTM(hidden_size=8, layers=1, frame_batch_size=1)
+        state = model.state_dict()
+        reloaded = Stage2TwoStreamBiLSTM(hidden_size=8, layers=1, frame_batch_size=1)
+
+        incompatible = reloaded.load_state_dict(state, strict=True)
+
+        self.assertEqual(incompatible.missing_keys, [])
+        self.assertEqual(incompatible.unexpected_keys, [])
+        self.assertEqual(model.temporal.input_size, 1024)
+        self.assertFalse(any(key.startswith("flow_projection") for key in state))
+        self.assertFalse(any(key.startswith("physics_projection") for key in state))
+
     def test_cnn_bilstm_returns_window_local_contract(self) -> None:
         model = Stage2CnnBiLSTM(hidden_size=8, layers=1, frame_batch_size=1).eval()
         with torch.inference_mode():
