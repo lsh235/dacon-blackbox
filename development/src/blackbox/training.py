@@ -7,6 +7,7 @@ from pathlib import Path
 from blackbox.stages.stage1 import fit_stage1
 from blackbox.stages.stage2 import fit_stage2
 from blackbox.stages.stage3 import fit_stage3
+from blackbox.training_control import TrainingControlConfig
 
 
 def train_baseline(
@@ -20,6 +21,7 @@ def train_baseline(
     stage1_focal_gamma: float = 2.0,
     stage1_augmentation: bool = True,
     stage1_tta_slots: int = 3,
+    training_control: TrainingControlConfig = TrainingControlConfig(),
 ) -> list[Path]:
     data = Path(data_root)
     model = Path(model_root)
@@ -34,6 +36,7 @@ def train_baseline(
                 focal_gamma=stage1_focal_gamma,
                 enable_augmentation=stage1_augmentation,
                 inference_tta_slots=stage1_tta_slots,
+                training_control=training_control,
             )
         )
     if 2 in stages:
@@ -42,10 +45,16 @@ def train_baseline(
             model / "stage2",
             epochs=epochs,
             pretrained_backbone=pretrained_stage2,
+            training_control=training_control,
         )
         artifacts.extend([checkpoint, backbone])
     if 3 in stages:
         artifacts.append(
-            fit_stage3(data / "stage3", model / "stage3", epochs=epochs)
+            fit_stage3(
+                data / "stage3",
+                model / "stage3",
+                epochs=epochs,
+                training_control=training_control,
+            )
         )
     return artifacts

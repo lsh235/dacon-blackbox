@@ -8,6 +8,7 @@ from pathlib import Path
 
 from blackbox.data_validation import validate_public_example
 from blackbox.training import train_baseline
+from blackbox.training_control import TrainingControlConfig
 
 
 def main() -> int:
@@ -40,6 +41,11 @@ def main() -> int:
         default=3,
         help="Number of early/middle/late temporal samples averaged for Stage 1 inference.",
     )
+    parser.add_argument("--min-learning-rate", type=float, default=1e-6)
+    parser.add_argument("--early-stopping-patience", type=int, default=5)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
+    parser.add_argument("--validation-fraction", type=float, default=0.2)
+    parser.add_argument("--log-dir", type=Path)
     args = parser.parse_args()
     if args.epochs < 0:
         parser.error("--epochs must be >= 0")
@@ -59,6 +65,13 @@ def main() -> int:
         stage1_focal_gamma=args.stage1_focal_gamma,
         stage1_augmentation=not args.stage1_no_augmentation,
         stage1_tta_slots=args.stage1_tta_slots,
+        training_control=TrainingControlConfig(
+            min_learning_rate=args.min_learning_rate,
+            early_stopping_patience=args.early_stopping_patience,
+            early_stopping_min_delta=args.early_stopping_min_delta,
+            validation_fraction=args.validation_fraction,
+            log_dir=args.log_dir,
+        ),
     )
     for artifact in artifacts:
         print(f"[OK] {artifact} ({artifact.stat().st_size / 1024**2:.1f} MiB)")

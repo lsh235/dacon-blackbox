@@ -11,15 +11,18 @@ from blackbox.stages.stage2.dataset_stage2 import IGNORE_INDEX
 from blackbox.stages.stage3.dataset_stage3 import (
     Stage3Annotation,
     Stage3SequenceWindowDataset,
+    Stage3TimeAxis,
     Stage3VideoRecord,
+    read_stage3_time_axis,
 )
 from blackbox.stages.stage3.model_stage3 import Stage3TwoStreamBiLSTM
+from blackbox.stages.stage3.train_stage3 import stage3_sequence_loss
 
 
 class Stage3SequenceDatasetTests(unittest.TestCase):
-    def test_sparse_labels_keep_source_frame_and_sample_index_separate(self) -> None:
-        frames = torch.zeros(3, 3, 16, 16)
-        frames[1, :, 4:10, 5:11] = 1.0
+    def test_sparse_labels_map_to_metadata_derived_0_1_second_chunks(self) -> None:
+        frames = torch.zeros(6, 3, 16, 16)
+        frames[4, :, 4:10, 5:11] = 1.0
         with tempfile.TemporaryDirectory() as temporary:
             video = Path(temporary) / "OPEN_001.mp4"
             video.write_bytes(b"stage3-fixture")
@@ -32,27 +35,67 @@ class Stage3SequenceDatasetTests(unittest.TestCase):
                 ),
             )
             with (
-                patch("blackbox.stages.stage2.dataset_stage2.video_frame_count", return_value=3),
+                patch("blackbox.stages.stage2.dataset_stage2.video_frame_count", return_value=6),
                 patch(
                     "blackbox.stages.stage2.dataset_stage2.decode_stage2_window",
-                    return_value=(frames, 3),
+                    return_value=(frames, 6),
+                ),
+                patch(
+                    "blackbox.stages.stage3.dataset_stage3.read_stage3_time_axis",
+                    return_value=Stage3TimeAxis(source_fps=30.0, frames_per_sample=3),
                 ),
             ):
                 dataset = Stage3SequenceWindowDataset(
                     [record],
-                    window_frames=3,
-                    stride=3,
+                    window_frames=6,
+                    stride=6,
                     size=16,
                     flow_cache_dir=Path(temporary) / "cache",
                 )
                 sample = dataset[0]
-        self.assertEqual(sample["frame_numbers"].tolist(), [0, 1, 2])
-        self.assertEqual(sample["sample_indices"].tolist(), [IGNORE_INDEX, 7, IGNORE_INDEX])
-        self.assertEqual(sample["accel_targets"].tolist(), [IGNORE_INDEX, 0, IGNORE_INDEX])
-        self.assertEqual(sample["steer_targets"].tolist(), [IGNORE_INDEX, 2, IGNORE_INDEX])
+        self.assertEqual(sample["frame_numbers"].tolist(), [0, 3])
+        self.assertEqual(sample["sample_indices"].tolist(), [7, IGNORE_INDEX])
+        self.assertEqual(sample["accel_targets"].tolist(), [0, IGNORE_INDEX])
+        self.assertEqual(sample["steer_targets"].tolist(), [2, IGNORE_INDEX])
+        self.assertEqual(int(sample["frames_per_sample"]), 3)
+
+    def test_fps_metadata_is_converted_to_0_1_second_steps_and_reports_conflict(self) -> None:
+        class Capture:
+            def isOpened(self) -> bool:
+                return True
+
+            def get(self, property_id: int) -> float:
+                self.property_id = property_id
+                return 59.94
+
+            def release(self) -> None:
+                self.released = True
+
+        annotations = (Stage3Annotation(5, 10, 0.5, 0, 1),)
+        with patch("blackbox.stages.stage3.dataset_stage3.cv2.VideoCapture", return_value=Capture()):
+            axis = read_stage3_time_axis("metadata-only.mp4", annotations=annotations)
+        self.assertEqual(axis.frames_per_sample, 6)
+        self.assertAlmostEqual(axis.source_fps, 59.94)
+        self.assertAlmostEqual(axis.label_frames_per_sample or 0.0, 2.0)
+        self.assertTrue(axis.has_label_conflict)
 
 
 class Stage3TwoStreamModelTests(unittest.TestCase):
+    def test_sparse_sequence_loss_ignores_unlabelled_steps(self) -> None:
+        accel = torch.tensor([[[2.0, 0.0, 0.0, 0.0], [float("-inf")] * 4]], requires_grad=True)
+        steer = torch.tensor([[[0.0, 0.0, 2.0], [float("-inf")] * 3]], requires_grad=True)
+        loss = stage3_sequence_loss(
+            {"accel_logits": accel, "steer_logits": steer},
+            {
+                "accel_targets": torch.tensor([[0, IGNORE_INDEX]]),
+                "steer_targets": torch.tensor([[2, IGNORE_INDEX]]),
+            },
+        )
+        self.assertIsNotNone(loss)
+        assert loss is not None
+        self.assertTrue(torch.isfinite(loss).item())
+        loss.backward()
+
     def test_seq2seq_heads_mask_padded_steps(self) -> None:
         model = Stage3TwoStreamBiLSTM(hidden_size=8, layers=1, frame_batch_size=1).eval()
         with torch.inference_mode():

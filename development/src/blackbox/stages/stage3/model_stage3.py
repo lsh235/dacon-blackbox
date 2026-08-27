@@ -15,10 +15,10 @@ STEER_CLASS_COUNT = 3
 class Stage3TwoStreamBiLSTM(TwoStreamBiLSTMEncoder):
     """Predict acceleration and steering logits at every valid sequence step.
 
-    The model deliberately emits one result per supplied source-frame position.
-    Converting those positions to the official 0.1-second ``sample_index`` is
-    a separate, explicit time-axis operation because the supplied documents do
-    not yet reconcile source FPS with that index.
+    The Stage 3 dataset supplies one pooled RGB/flow map per metadata-derived
+    0.1-second step, so each output position is a candidate official sample.
+    It also propagates a metadata/label conflict flag where the public example
+    cannot reconcile its reported FPS with sparse source-frame annotations.
     """
 
     def __init__(

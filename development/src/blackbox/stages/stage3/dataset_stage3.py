@@ -1,17 +1,21 @@
-"""Sparse-label, sliding-window inputs for the Stage 3 Seq2Seq research path.
+"""Sparse-label 10 Hz windows for the Stage 3 Seq2Seq research path.
 
-Source-frame positions and official 0.1-second sample indices are both kept in
-the sample contract.  This module never invents an FPS conversion: callers can
-train on the supplied ``frame_index`` labels while a future official time-axis
-configuration selects inference rows.
+RGB frames and dense flow remain spatial tensors until the shared two-stream
+CNN.  Consecutive raw frames are pooled into one 0.1-second step *before* the
+BiLSTM, using each video's OpenCV-reported FPS.  Both source-frame positions
+and supplied sample indices remain in the contract so inconsistent metadata is
+visible instead of silently changing the official output timeline.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Sequence
 
+import cv2
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
@@ -35,6 +39,72 @@ STEER_LABEL_TO_INDEX = {"LEFT": 0, "STRAIGHT": 1, "RIGHT": 2}
 DEFAULT_STAGE3_FLOW_CACHE_DIR = (
     DEFAULT_OPTICAL_FLOW_CACHE_DIR.parent.parent / "stage3" / "optical_flow"
 )
+STAGE3_SAMPLES_PER_SECOND = 10.0
+
+
+@dataclass(frozen=True)
+class Stage3TimeAxis:
+    """One video's metadata-derived conversion from source frames to 10 Hz."""
+
+    source_fps: float
+    frames_per_sample: int
+    label_frames_per_sample: float | None = None
+
+    @property
+    def has_label_conflict(self) -> bool:
+        """Whether sparse labels disagree materially with video FPS metadata."""
+
+        return (
+            self.label_frames_per_sample is not None
+            and not math.isclose(
+                float(self.frames_per_sample),
+                self.label_frames_per_sample,
+                rel_tol=0.05,
+                abs_tol=0.5,
+            )
+        )
+
+
+def infer_label_frames_per_sample(annotations: Sequence["Stage3Annotation"]) -> float | None:
+    """Estimate frame/sample spacing from labels only for discrepancy reporting."""
+
+    ratios = [
+        annotation.frame_index / annotation.sample_index
+        for annotation in annotations
+        if annotation.sample_index > 0
+    ]
+    return float(np.median(ratios)) if ratios else None
+
+
+def read_stage3_time_axis(
+    video_path: str | Path,
+    *,
+    annotations: Sequence["Stage3Annotation"] = (),
+) -> Stage3TimeAxis:
+    """Read FPS through OpenCV and convert it to the nearest 0.1-second chunk.
+
+    ``CAP_PROP_FPS`` is intentionally recorded rather than replaced by a
+    dataset-specific constant.  Some supplied public files report metadata
+    that conflicts with their sparse labels; ``has_label_conflict`` lets an
+    experiment reject or audit those rows before treating the conversion as an
+    official inference mapping.
+    """
+
+    path = Path(video_path)
+    capture = cv2.VideoCapture(str(path))
+    try:
+        if not capture.isOpened():
+            raise ValueError(f"cannot open Stage 3 video for FPS metadata: {path}")
+        source_fps = float(capture.get(cv2.CAP_PROP_FPS))
+    finally:
+        capture.release()
+    if not math.isfinite(source_fps) or source_fps <= 0.0:
+        raise ValueError(f"Stage 3 video has invalid CAP_PROP_FPS={source_fps!r}: {path}")
+    return Stage3TimeAxis(
+        source_fps=source_fps,
+        frames_per_sample=max(1, round(source_fps / STAGE3_SAMPLES_PER_SECOND)),
+        label_frames_per_sample=infer_label_frames_per_sample(annotations),
+    )
 
 
 @dataclass(frozen=True)
@@ -125,7 +195,7 @@ def read_stage3_records(data_dir: str | Path) -> list[Stage3VideoRecord]:
 
 
 class Stage3SequenceWindowDataset(Dataset):
-    """Reuse the cached Stage 2 RGB+flow window decoder for Stage 3 labels."""
+    """Convert cached raw RGB+flow windows into metadata-derived 10 Hz steps."""
 
     def __init__(
         self,
@@ -140,6 +210,10 @@ class Stage3SequenceWindowDataset(Dataset):
         if not records:
             raise ValueError("Stage 3 records must not be empty")
         self._annotations = {record.video_id: record.annotations for record in records}
+        self._time_axes = {
+            record.video_id: read_stage3_time_axis(record.video_path, annotations=record.annotations)
+            for record in records
+        }
         self._windows = Stage2SlidingWindowDataset(
             [Stage2VideoRecord(record.video_id, record.video_path) for record in records],
             window_frames=window_frames,
@@ -161,6 +235,61 @@ class Stage3SequenceWindowDataset(Dataset):
     def __len__(self) -> int:
         return len(self._windows)
 
+    @staticmethod
+    def _pool_to_time_steps(
+        frames: torch.Tensor,
+        flow: torch.Tensor,
+        frame_numbers: torch.Tensor,
+        *,
+        valid_length: int,
+        frames_per_sample: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[tuple[int, int]]]:
+        """Pool each source-frame chunk while preserving its spatial layout."""
+
+        if frames.ndim != 4 or flow.ndim != 4:
+            raise ValueError("raw Stage 3 frames and flow must be [time, channels, height, width]")
+        if frames.shape[0] != flow.shape[0] or frame_numbers.numel() != frames.shape[0]:
+            raise ValueError("raw Stage 3 tensors must share the same time dimension")
+        if not 1 <= valid_length <= frames.shape[0]:
+            raise ValueError("valid_length must be in [1, raw time]")
+        if frames_per_sample < 1:
+            raise ValueError("frames_per_sample must be >= 1")
+
+        # The window can start at an arbitrary source frame.  Drop only its
+        # prefix until the next global 0.1-second boundary; overlapping windows
+        # cover the same prefix in the preceding chunk.
+        first_source_frame = int(frame_numbers[0].item())
+        local_start = (-first_source_frame) % frames_per_sample
+        pooled_frames: list[torch.Tensor] = []
+        pooled_flow: list[torch.Tensor] = []
+        pooled_numbers: list[int] = []
+        source_ranges: list[tuple[int, int]] = []
+        while local_start < valid_length:
+            local_end = min(local_start + frames_per_sample, valid_length)
+            pooled_frames.append(frames[local_start:local_end].mean(dim=0))
+            # Mean pooling retains an HxW flow map for the temporal CNN; it
+            # never collapses the road-ground motion to a scalar statistic.
+            pooled_flow.append(flow[local_start:local_end].mean(dim=0))
+            start = int(frame_numbers[local_start].item())
+            end = int(frame_numbers[local_end - 1].item()) + 1
+            pooled_numbers.append(start)
+            source_ranges.append((start, end))
+            local_start = local_end
+        if not pooled_frames:
+            # A sub-step tail can occur only for an unaligned one-frame window.
+            # Retain it rather than emitting an empty sequence to the LSTM.
+            pooled_frames = [frames[:valid_length].mean(dim=0)]
+            pooled_flow = [flow[:valid_length].mean(dim=0)]
+            start = int(frame_numbers[0].item())
+            pooled_numbers = [start]
+            source_ranges = [(start, int(frame_numbers[valid_length - 1].item()) + 1)]
+        return (
+            torch.stack(pooled_frames),
+            torch.stack(pooled_flow),
+            torch.tensor(pooled_numbers, dtype=torch.long),
+            source_ranges,
+        )
+
     def __getitem__(self, index: int) -> dict[str, object]:
         source = self._windows[index]
         video_id = str(source["id"])
@@ -168,26 +297,41 @@ class Stage3SequenceWindowDataset(Dataset):
         valid_length = int(source["valid_length"])
         if not isinstance(frame_numbers, torch.Tensor):
             raise TypeError("Stage 2 window frame_numbers must be a tensor")
+        frames = source["frames"]
+        flow = source["flow"]
+        if not isinstance(frames, torch.Tensor) or not isinstance(flow, torch.Tensor):
+            raise TypeError("Stage 2 window frames and flow must be tensors")
+        time_axis = self._time_axes[video_id]
+        frames, flow, frame_numbers, source_ranges = self._pool_to_time_steps(
+            frames,
+            flow,
+            frame_numbers,
+            valid_length=valid_length,
+            frames_per_sample=time_axis.frames_per_sample,
+        )
         accel_targets = torch.full_like(frame_numbers, IGNORE_INDEX)
         steer_targets = torch.full_like(frame_numbers, IGNORE_INDEX)
         sample_indices = torch.full_like(frame_numbers, IGNORE_INDEX)
-        start_frame = int(frame_numbers[0])
         for annotation in self._annotations[video_id]:
-            local_index = annotation.frame_index - start_frame
-            if 0 <= local_index < valid_length:
-                accel_targets[local_index] = annotation.accel_target
-                steer_targets[local_index] = annotation.steer_target
-                sample_indices[local_index] = annotation.sample_index
+            for local_index, (start_frame, end_frame) in enumerate(source_ranges):
+                if start_frame <= annotation.frame_index < end_frame:
+                    accel_targets[local_index] = annotation.accel_target
+                    steer_targets[local_index] = annotation.steer_target
+                    sample_indices[local_index] = annotation.sample_index
+                    break
         return {
             "id": video_id,
-            "frames": source["frames"],
-            "flow": source["flow"],
+            "frames": frames,
+            "flow": flow,
             "flow_cache_hit": source["flow_cache_hit"],
-            "valid_length": source["valid_length"],
+            "valid_length": torch.tensor(frames.shape[0], dtype=torch.long),
             "frame_numbers": frame_numbers,
             "sample_indices": sample_indices,
             "accel_targets": accel_targets,
             "steer_targets": steer_targets,
+            "source_fps": torch.tensor(time_axis.source_fps, dtype=torch.float32),
+            "frames_per_sample": torch.tensor(time_axis.frames_per_sample, dtype=torch.long),
+            "time_axis_conflict": torch.tensor(time_axis.has_label_conflict, dtype=torch.bool),
         }
 
 
@@ -196,17 +340,33 @@ def collate_stage3_windows(samples: Sequence[dict[str, object]]) -> dict[str, ob
 
     if not samples:
         raise ValueError("cannot collate an empty Stage 3 batch")
-    tensor_keys = (
-        "frames",
-        "flow",
-        "flow_cache_hit",
-        "valid_length",
-        "frame_numbers",
-        "sample_indices",
-        "accel_targets",
-        "steer_targets",
-    )
+    time = max(int(sample["valid_length"]) for sample in samples)
+
+    def pad_time(tensor: torch.Tensor, *, value: float | int = 0) -> torch.Tensor:
+        if tensor.shape[0] == time:
+            return tensor
+        padding = torch.full(
+            (time - tensor.shape[0], *tensor.shape[1:]),
+            value,
+            dtype=tensor.dtype,
+        )
+        return torch.cat([tensor, padding], dim=0)
+
+    time_tensor_keys = ("frames", "flow", "frame_numbers", "sample_indices", "accel_targets", "steer_targets")
+    padding_values = {
+        "frames": 0.0,
+        "flow": 0.0,
+        "frame_numbers": 0,
+        "sample_indices": IGNORE_INDEX,
+        "accel_targets": IGNORE_INDEX,
+        "steer_targets": IGNORE_INDEX,
+    }
+    scalar_tensor_keys = ("flow_cache_hit", "valid_length", "source_fps", "frames_per_sample", "time_axis_conflict")
     return {
         "id": [str(sample["id"]) for sample in samples],
-        **{key: torch.stack([sample[key] for sample in samples]) for key in tensor_keys},
+        **{
+            key: torch.stack([pad_time(sample[key], value=padding_values[key]) for sample in samples])
+            for key in time_tensor_keys
+        },
+        **{key: torch.stack([sample[key] for sample in samples]) for key in scalar_tensor_keys},
     }

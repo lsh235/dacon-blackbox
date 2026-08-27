@@ -7,10 +7,57 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from blackbox.submission_pipeline import generate_submission_bundle
+from blackbox.submission_pipeline import (
+    generate_submission_bundle,
+    project_stage3_source_frames_by_video_fps,
+)
+from blackbox.stages.stage3.dataset_stage3 import Stage3TimeAxis
 
 
 class SubmissionPipelineTests(unittest.TestCase):
+    def test_stage3_projection_uses_each_videos_fps_derived_stride(self) -> None:
+        source = pd.DataFrame(
+            [
+                {
+                    "ID": "S3_30FPS",
+                    "sample_index": index,
+                    "accel_label": "CONSTANT",
+                    "steer_label": "STRAIGHT",
+                }
+                for index in range(6)
+            ]
+            + [
+                {
+                    "ID": "S3_60FPS",
+                    "sample_index": index,
+                    "accel_label": "CONSTANT",
+                    "steer_label": "STRAIGHT",
+                }
+                for index in range(12)
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            videos = Path(temporary)
+            for video_id in ("S3_30FPS", "S3_60FPS"):
+                (videos / f"{video_id}.mp4").write_bytes(b"fixture")
+            with patch(
+                "blackbox.submission_pipeline.read_stage3_time_axis",
+                side_effect=[
+                    Stage3TimeAxis(30.0, 3),
+                    Stage3TimeAxis(60.0, 6),
+                ],
+            ):
+                projected, axes = project_stage3_source_frames_by_video_fps(
+                    source,
+                    video_dir=videos,
+                )
+        self.assertEqual(projected.groupby("ID")["sample_index"].count().to_dict(), {
+            "S3_30FPS": 2,
+            "S3_60FPS": 2,
+        })
+        self.assertEqual(axes["S3_30FPS"]["frames_per_sample"], 3)
+        self.assertEqual(axes["S3_60FPS"]["frames_per_sample"], 6)
+
     def test_sequential_pipeline_projects_stage3_and_falls_back_per_failed_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "input"

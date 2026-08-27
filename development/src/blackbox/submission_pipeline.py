@@ -16,6 +16,7 @@ from blackbox.common.runtime import video_paths
 from blackbox.contracts import STAGE_COLUMNS, validate_prediction_frame
 from blackbox.inference import predict_stage1, predict_stage2, predict_stage3
 from blackbox.stages.stage2.dataset_stage2 import video_frame_count
+from blackbox.stages.stage3.dataset_stage3 import read_stage3_time_axis
 
 
 StagePredictor = Callable[[str | Path, str | Path], pd.DataFrame]
@@ -67,12 +68,29 @@ def _stage2_fallback(data_dir: Path) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=STAGE_COLUMNS["stage2"])
 
 
-def _stage3_fallback(data_dir: Path, *, frames_per_sample: int) -> pd.DataFrame:
+def _stage3_stride(path: Path, *, frames_per_sample: int | None) -> tuple[int, dict[str, object]]:
+    """Resolve an explicit override or this video's OpenCV FPS-derived stride."""
+
+    if frames_per_sample is not None:
+        if frames_per_sample < 1:
+            raise ValueError("frames_per_sample must be >= 1")
+        return frames_per_sample, {"mode": "explicit_override", "frames_per_sample": frames_per_sample}
+    axis = read_stage3_time_axis(path)
+    return axis.frames_per_sample, {
+        "mode": "cap_prop_fps",
+        "source_fps": axis.source_fps,
+        "frames_per_sample": axis.frames_per_sample,
+        "label_conflict": axis.has_label_conflict,
+    }
+
+
+def _stage3_fallback(data_dir: Path, *, frames_per_sample: int | None) -> pd.DataFrame:
     rows = []
     for path in video_paths(data_dir / "videos"):
         try:
+            stride, _ = _stage3_stride(path, frames_per_sample=frames_per_sample)
             frame_count = video_frame_count(path)
-            sample_count = max(1, (frame_count + frames_per_sample - 1) // frames_per_sample)
+            sample_count = max(1, (frame_count + stride - 1) // stride)
         except ValueError:
             # A damaged video still needs one contract-valid row if its ID is
             # discoverable; the caller records this fallback in the manifest.
@@ -111,6 +129,36 @@ def project_stage3_source_frames(prediction: pd.DataFrame, *, frames_per_sample:
     return pd.concat(rows, ignore_index=True)[STAGE_COLUMNS["stage3"]]
 
 
+def project_stage3_source_frames_by_video_fps(
+    prediction: pd.DataFrame,
+    *,
+    video_dir: str | Path,
+    frames_per_sample: int | None = None,
+) -> tuple[pd.DataFrame, dict[str, dict[str, object]]]:
+    """Project raw-frame outputs to 10 Hz using one stride per source video.
+
+    An explicit value is retained as a diagnostic/competition override.  In
+    normal operation each video uses ``round(CAP_PROP_FPS / 10)`` so mixed 30
+    and 60 FPS inputs do not share an accidental static stride.
+    """
+
+    source = validate_prediction_frame("stage3", prediction).copy()
+    root = Path(video_dir)
+    rows: list[pd.DataFrame] = []
+    time_axes: dict[str, dict[str, object]] = {}
+    for video_id, group in source.groupby("ID", sort=False):
+        video_path = root / f"{video_id}.mp4"
+        stride, metadata = _stage3_stride(video_path, frames_per_sample=frames_per_sample)
+        ordered = group.sort_values("sample_index", kind="stable")
+        selected = ordered.iloc[::stride].copy()
+        selected["sample_index"] = range(len(selected))
+        rows.append(selected)
+        time_axes[str(video_id)] = metadata
+    if not rows:
+        return pd.DataFrame(columns=STAGE_COLUMNS["stage3"]), time_axes
+    return pd.concat(rows, ignore_index=True)[STAGE_COLUMNS["stage3"]], time_axes
+
+
 def _expected_ids(stage: int, data_dir: Path) -> set[str]:
     if stage in {1, 3}:
         return {path.stem for path in video_paths(data_dir / "videos")}
@@ -120,7 +168,7 @@ def _expected_ids(stage: int, data_dir: Path) -> set[str]:
     return {path.name for path in image_root.iterdir() if path.is_dir()}
 
 
-def _fallback_for_stage(stage: int, data_dir: Path, *, frames_per_sample: int) -> pd.DataFrame:
+def _fallback_for_stage(stage: int, data_dir: Path, *, frames_per_sample: int | None) -> pd.DataFrame:
     if stage == 1:
         return _stage1_fallback(data_dir)
     if stage == 2:
@@ -177,7 +225,7 @@ def generate_submission_bundle(
     model_root: str | Path,
     output_root: str | Path,
     *,
-    stage3_frames_per_sample: int,
+    stage3_frames_per_sample: int | None = None,
     sample_submissions: Mapping[int, str | Path] | None = None,
     predictors: Mapping[int, StagePredictor] = DEFAULT_PREDICTORS,
 ) -> dict[str, object]:
@@ -189,14 +237,18 @@ def generate_submission_bundle(
     partial result, receives documented contract-safe fallback rows.
     """
 
-    if stage3_frames_per_sample < 1:
+    if stage3_frames_per_sample is not None and stage3_frames_per_sample < 1:
         raise ValueError("stage3_frames_per_sample must be >= 1")
     root = Path(data_root)
     models = Path(model_root)
     output = Path(output_root)
     output.mkdir(parents=True, exist_ok=True)
     samples = sample_submissions or {}
-    summary: dict[str, object] = {"fallback_stages": [], "stages": {}}
+    summary: dict[str, object] = {
+        "fallback_stages": [],
+        "stages": {},
+        "stage3_time_axis_mode": "explicit_override" if stage3_frames_per_sample is not None else "cap_prop_fps",
+    }
 
     for stage in (1, 2, 3):
         stage_name = f"stage{stage}"
@@ -209,8 +261,9 @@ def generate_submission_bundle(
             prediction = predictors[stage](stage_data, models / stage_name)
             prediction = validate_prediction_frame(stage_name, prediction)
             if stage == 3:
-                prediction = project_stage3_source_frames(
+                prediction, time_axes = project_stage3_source_frames_by_video_fps(
                     prediction,
+                    video_dir=stage_data / "videos",
                     frames_per_sample=stage3_frames_per_sample,
                 )
         except Exception as exc:  # Safe output is preferable to an absent CSV.
@@ -237,6 +290,8 @@ def generate_submission_bundle(
             "elapsed_seconds": round(perf_counter() - started, 3),
             "fallback": error,
         }
+        if stage == 3 and error is None:
+            stage_summary["time_axes"] = time_axes
         summary["stages"][stage_name] = stage_summary
 
     manifest = output / "submission_manifest.json"

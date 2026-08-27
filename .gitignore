@@ -31,5 +31,6 @@ development/data/raw/
 development/data/interim/
 development/data/processed/
 development/artifacts/
+development/logs/
 development/notebooks/.ipynb_checkpoints/
 development/submit.zip

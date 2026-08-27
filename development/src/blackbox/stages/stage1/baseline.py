@@ -23,6 +23,14 @@ from blackbox.common.runtime import (
     video_paths,
 )
 from blackbox.contracts import validate_prediction_frame
+from blackbox.training_control import (
+    EarlyStopping,
+    JsonlTrainingLogger,
+    TrainingControlConfig,
+    cosine_scheduler,
+    group_holdout_indices,
+    macro_f1_score,
+)
 from blackbox.stages.stage1.dataset import (
     DEFAULT_FEATURE_MODE,
     RGB_FEATURES,
@@ -92,6 +100,7 @@ def fit_stage1(
     enable_augmentation: bool = True,
     inference_tta_slots: int = DEFAULT_TTA_SLOTS,
     label_frame: pd.DataFrame | None = None,
+    training_control: TrainingControlConfig = TrainingControlConfig(),
 ) -> Path:
     if epochs < 0:
         raise ValueError("epochs must be >= 0")
@@ -123,10 +132,16 @@ def fit_stage1(
     if missing:
         raise FileNotFoundError(f"Stage 1 training videos not found: {missing}")
 
+    train_indices, valid_indices = group_holdout_indices(
+        [path.stem for path, _ in samples],
+        validation_fraction=training_control.validation_fraction,
+    )
+    train_samples = [sample for index, sample in enumerate(samples) if index in train_indices]
+    valid_samples = [sample for index, sample in enumerate(samples) if index in valid_indices]
     device = choose_device()
     augmentation = Stage1TrainAugmentation() if enable_augmentation else None
     dataset = Stage1TrainingDataset(
-        samples,
+        train_samples,
         size=size,
         frames=frames,
         feature_mode=feature_mode,
@@ -140,11 +155,39 @@ def fit_stage1(
         generator=generator,
         pin_memory=device.type == "cuda",
     )
+    validation_loader = (
+        DataLoader(
+            Stage1TrainingDataset(
+                valid_samples,
+                size=size,
+                frames=frames,
+                feature_mode=feature_mode,
+                augmentation=None,
+            ),
+            batch_size=batch_size,
+            shuffle=False,
+            pin_memory=device.type == "cuda",
+        )
+        if valid_samples
+        else None
+    )
     model = Stage1MViT(feature_mode=feature_mode).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     criterion = FocalLoss(gamma=focal_gamma)
-    for _ in range(max(0, epochs)):
+    scheduler = cosine_scheduler(
+        optimizer,
+        epochs=epochs,
+        minimum_learning_rate=training_control.min_learning_rate,
+    )
+    logger = JsonlTrainingLogger("stage1", training_control.log_dir)
+    early_stopping = EarlyStopping(
+        mode="max" if validation_loader is not None else "min",
+        patience=training_control.early_stopping_patience,
+        min_delta=training_control.early_stopping_min_delta,
+    )
+    for epoch in range(max(0, epochs)):
         model.train()
+        losses: list[float] = []
         for clips, targets in loader:
             clips = clips.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
@@ -152,6 +195,39 @@ def fit_stage1(
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            losses.append(float(loss.detach().cpu()))
+        average_loss = sum(losses) / max(1, len(losses))
+        valid_metric: float | None = None
+        if validation_loader is not None:
+            model.eval()
+            valid_targets: list[int] = []
+            valid_predictions: list[int] = []
+            with torch.inference_mode():
+                for clips, targets in validation_loader:
+                    logits = model(clips.to(device, non_blocking=True))
+                    valid_targets.extend(targets.tolist())
+                    valid_predictions.extend(logits.argmax(dim=1).cpu().tolist())
+            valid_metric = macro_f1_score(valid_targets, valid_predictions, labels=range(2))
+        learning_rate = float(optimizer.param_groups[0]["lr"])
+        monitor_name = "valid_macro_f1_group_holdout" if valid_metric is not None else "train_loss_proxy_no_validation"
+        monitor_value = valid_metric if valid_metric is not None else average_loss
+        logger.log(
+            epoch=epoch + 1,
+            train_loss=average_loss,
+            learning_rate=learning_rate,
+            valid_metric=valid_metric,
+            monitor_name=monitor_name,
+            monitor_value=monitor_value,
+        )
+        print(
+            f"[Stage1][epoch {epoch + 1}/{epochs}] loss={average_loss:.6f} "
+            f"lr={learning_rate:.3e} valid_macro_f1="
+            f"{'unavailable' if valid_metric is None else f'{valid_metric:.6f}'}"
+        )
+        scheduler.step()
+        if early_stopping.step(monitor_value):
+            print(f"[Stage1] early stopping at epoch {epoch + 1}")
+            break
     checkpoint = output / "best.pt"
     torch.save(
         {
@@ -175,7 +251,7 @@ def fit_stage1(
         },
         checkpoint,
     )
-    del criterion, dataset, loader, optimizer, model
+    del criterion, dataset, loader, validation_loader, scheduler, optimizer, model
     release_device_cache(device)
     return checkpoint
 

@@ -26,6 +26,12 @@ from blackbox.stages.stage2.dataset_stage2 import (
     read_stage2_records,
 )
 from blackbox.stages.stage2.model_stage2 import Stage2TwoStreamBiLSTM
+from blackbox.training_control import (
+    EarlyStopping,
+    JsonlTrainingLogger,
+    TrainingControlConfig,
+    cosine_scheduler,
+)
 
 
 @dataclass(frozen=True)
@@ -60,6 +66,7 @@ class Stage2WindowTrainingConfig:
     flow_cache_dir: str | None = str(DEFAULT_OPTICAL_FLOW_CACHE_DIR)
     farneback: FarnebackConfig = FarnebackConfig()
     target_mapping: TargetMappingConfig = TargetMappingConfig()
+    training_control: TrainingControlConfig = TrainingControlConfig()
 
     def __post_init__(self) -> None:
         if min(self.window_frames, self.stride, self.size, self.batch_size, self.frame_batch_size) < 1:
@@ -312,16 +319,41 @@ def fit_stage2_window_skeleton(
     )
     model = Stage2TwoStreamBiLSTM(frame_batch_size=config.frame_batch_size).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    scheduler = cosine_scheduler(
+        optimizer,
+        epochs=epochs,
+        minimum_learning_rate=config.training_control.min_learning_rate,
+    )
+    logger = JsonlTrainingLogger("stage2_two_stream", config.training_control.log_dir)
+    early_stopping = EarlyStopping(
+        mode="min",
+        patience=config.training_control.early_stopping_patience,
+        min_delta=config.training_control.early_stopping_min_delta,
+    )
     for epoch in range(epochs):
         hits_before, misses_before = dataset.flow_cache_hits, dataset.flow_cache_misses
         average_loss = train_stage2_window_epoch(
             model, loader, optimizer, device=device, target_config=config.target_mapping
         )
+        learning_rate = float(optimizer.param_groups[0]["lr"])
+        logger.log(
+            epoch=epoch + 1,
+            train_loss=average_loss,
+            learning_rate=learning_rate,
+            valid_metric=None,
+            monitor_name="train_loss_proxy_no_validation",
+            monitor_value=average_loss,
+        )
         print(
             f"[Stage2][epoch {epoch + 1}/{epochs}] loss={average_loss:.6f} "
+            f"lr={learning_rate:.3e} valid_metric=unavailable "
             f"flow_cache(hit={dataset.flow_cache_hits - hits_before}, "
             f"miss={dataset.flow_cache_misses - misses_before})"
         )
+        scheduler.step()
+        if early_stopping.step(average_loss):
+            print(f"[Stage2] early stopping at epoch {epoch + 1}")
+            break
     output = Path(model_dir)
     output.mkdir(parents=True, exist_ok=True)
     checkpoint = output / "stage2_two_stream_experimental.pt"
@@ -336,7 +368,7 @@ def fit_stage2_window_skeleton(
         },
         checkpoint,
     )
-    del dataset, loader, model, optimizer
+    del dataset, loader, model, scheduler, optimizer
     release_device_cache(device)
     return checkpoint
 
@@ -356,6 +388,10 @@ def main() -> int:
     parser.add_argument("--target-mode", choices=("binary_mask", "gaussian"), default="gaussian")
     parser.add_argument("--gaussian-sigma", type=float, default=2.0)
     parser.add_argument("--aggregation-policy", choices=("mean", "max"), default="mean")
+    parser.add_argument("--min-learning-rate", type=float, default=1e-6)
+    parser.add_argument("--early-stopping-patience", type=int, default=5)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
+    parser.add_argument("--log-dir", type=Path)
     args = parser.parse_args()
     checkpoint = fit_stage2_window_skeleton(
         args.data_dir,
@@ -373,6 +409,12 @@ def main() -> int:
                 mode=args.target_mode,
                 gaussian_sigma=args.gaussian_sigma,
                 aggregation_policy=args.aggregation_policy,
+            ),
+            training_control=TrainingControlConfig(
+                min_learning_rate=args.min_learning_rate,
+                early_stopping_patience=args.early_stopping_patience,
+                early_stopping_min_delta=args.early_stopping_min_delta,
+                log_dir=args.log_dir,
             ),
         ),
     )

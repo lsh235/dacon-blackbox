@@ -22,6 +22,13 @@ from blackbox.common.runtime import (
     seed_everything,
 )
 from blackbox.contracts import validate_prediction_frame
+from blackbox.training_control import (
+    EarlyStopping,
+    JsonlTrainingLogger,
+    TrainingControlConfig,
+    cosine_scheduler,
+    group_holdout_indices,
+)
 
 
 class Stage2Temporal(nn.Module):
@@ -79,6 +86,7 @@ def fit_stage2(
     epochs: int = 1,
     seed: int = DEFAULT_SEED,
     pretrained_backbone: bool = False,
+    training_control: TrainingControlConfig = TrainingControlConfig(),
 ) -> tuple[Path, Path]:
     seed_everything(seed)
     data_root = Path(data_dir)
@@ -93,7 +101,7 @@ def fit_stage2(
     backbone.to(device).eval()
     transform = ResNet18_Weights.IMAGENET1K_V1.transforms()
 
-    sequences: list[tuple[torch.Tensor, int]] = []
+    sequences: list[tuple[str, torch.Tensor, int]] = []
     with torch.inference_mode():
         for row in labels.itertuples():
             frames = decode_video_frames(data_root / row.path)
@@ -103,15 +111,32 @@ def fit_stage2(
                     [transform(Image.fromarray(frame)) for frame in frames[start : start + 64]]
                 ).to(device)
                 batches.append(backbone(images).float().cpu())
-            sequences.append(
-                (torch.cat(batches), min(int(row.t_collision), len(frames) - 1))
-            )
+            sequences.append((str(row.ID), torch.cat(batches), min(int(row.t_collision), len(frames) - 1)))
+
+    train_indices, valid_indices = group_holdout_indices(
+        [video_id for video_id, _, _ in sequences],
+        validation_fraction=training_control.validation_fraction,
+    )
+    train_sequences = [sequence for index, sequence in enumerate(sequences) if index in train_indices]
+    valid_sequences = [sequence for index, sequence in enumerate(sequences) if index in valid_indices]
 
     temporal = Stage2Temporal().to(device)
     optimizer = torch.optim.AdamW(temporal.parameters(), lr=2e-4)
-    for _ in range(max(0, epochs)):
+    scheduler = cosine_scheduler(
+        optimizer,
+        epochs=epochs,
+        minimum_learning_rate=training_control.min_learning_rate,
+    )
+    logger = JsonlTrainingLogger("stage2", training_control.log_dir)
+    early_stopping = EarlyStopping(
+        mode="max" if valid_sequences else "min",
+        patience=training_control.early_stopping_patience,
+        min_delta=training_control.early_stopping_min_delta,
+    )
+    for epoch in range(max(0, epochs)):
         temporal.train()
-        for sequence, target in sequences:
+        losses: list[float] = []
+        for _, sequence, target in train_sequences:
             collision, _, _ = temporal.logits(sequence[None].to(device))
             loss = nn.functional.cross_entropy(
                 collision,
@@ -120,9 +145,40 @@ def fit_stage2(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            losses.append(float(loss.detach().cpu()))
+        average_loss = sum(losses) / max(1, len(losses))
+        valid_metric: float | None = None
+        if valid_sequences:
+            temporal.eval()
+            correct = 0
+            with torch.inference_mode():
+                for _, sequence, target in valid_sequences:
+                    collision, _, _ = temporal.logits(sequence[None].to(device))
+                    correct += int(int(collision.argmax(dim=1).item()) == target)
+            valid_metric = correct / len(valid_sequences)
+        learning_rate = float(optimizer.param_groups[0]["lr"])
+        monitor_name = "valid_collision_top1_group_holdout" if valid_metric is not None else "train_loss_proxy_no_validation"
+        monitor_value = valid_metric if valid_metric is not None else average_loss
+        logger.log(
+            epoch=epoch + 1,
+            train_loss=average_loss,
+            learning_rate=learning_rate,
+            valid_metric=valid_metric,
+            monitor_name=monitor_name,
+            monitor_value=monitor_value,
+        )
+        print(
+            f"[Stage2][epoch {epoch + 1}/{epochs}] loss={average_loss:.6f} "
+            f"lr={learning_rate:.3e} valid_collision_top1="
+            f"{'unavailable' if valid_metric is None else f'{valid_metric:.6f}'}"
+        )
+        scheduler.step()
+        if early_stopping.step(monitor_value):
+            print(f"[Stage2] early stopping at epoch {epoch + 1}")
+            break
     checkpoint = output / "best.pt"
     torch.save({"model": temporal.state_dict()}, checkpoint)
-    del backbone, temporal, optimizer, sequences
+    del backbone, temporal, scheduler, optimizer, sequences, train_sequences, valid_sequences
     release_device_cache(device)
     return checkpoint, backbone_path
 

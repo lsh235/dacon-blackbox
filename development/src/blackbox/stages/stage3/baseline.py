@@ -26,6 +26,14 @@ from blackbox.common.runtime import (
     video_paths,
 )
 from blackbox.contracts import validate_prediction_frame
+from blackbox.training_control import (
+    EarlyStopping,
+    JsonlTrainingLogger,
+    TrainingControlConfig,
+    cosine_scheduler,
+    group_holdout_indices,
+    macro_f1_score,
+)
 
 
 ACCEL_LABELS = ["ACCELERATING", "DECELERATING", "CONSTANT", "STOPPED"]
@@ -52,6 +60,7 @@ def fit_stage3(
     *,
     epochs: int = 1,
     seed: int = DEFAULT_SEED,
+    training_control: TrainingControlConfig = TrainingControlConfig(),
 ) -> Path:
     seed_everything(seed)
     data_root = Path(data_dir)
@@ -60,12 +69,31 @@ def fit_stage3(
     labels = pd.read_csv(data_root / "labels.csv")
     accel_map = {label: index for index, label in enumerate(ACCEL_LABELS)}
     steer_map = {label: index for index, label in enumerate(STEER_LABELS)}
+    rows = list(labels.itertuples())
+    train_indices, valid_indices = group_holdout_indices(
+        [str(row.ID) for row in rows],
+        validation_fraction=training_control.validation_fraction,
+    )
+    train_rows = [row for index, row in enumerate(rows) if index in train_indices]
+    valid_rows = [row for index, row in enumerate(rows) if index in valid_indices]
     device = choose_device()
     model = Stage3MViT().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-    for _ in range(max(0, epochs)):
+    scheduler = cosine_scheduler(
+        optimizer,
+        epochs=epochs,
+        minimum_learning_rate=training_control.min_learning_rate,
+    )
+    logger = JsonlTrainingLogger("stage3", training_control.log_dir)
+    early_stopping = EarlyStopping(
+        mode="max" if valid_rows else "min",
+        patience=training_control.early_stopping_patience,
+        min_delta=training_control.early_stopping_min_delta,
+    )
+    for epoch in range(max(0, epochs)):
         model.train()
-        for row in labels.itertuples():
+        losses: list[float] = []
+        for row in train_rows:
             clip, _ = center_clip(
                 data_root / "videos" / f"{row.ID}.mp4",
                 frames=16,
@@ -84,9 +112,55 @@ def fit_stage3(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            losses.append(float(loss.detach().cpu()))
+        average_loss = sum(losses) / max(1, len(losses))
+        valid_metric: float | None = None
+        if valid_rows:
+            model.eval()
+            accel_targets: list[int] = []
+            accel_predictions: list[int] = []
+            steer_targets: list[int] = []
+            steer_predictions: list[int] = []
+            with torch.inference_mode():
+                for row in valid_rows:
+                    clip, _ = center_clip(
+                        data_root / "videos" / f"{row.ID}.mp4",
+                        frames=16,
+                        center=int(row.frame_index),
+                    )
+                    clip = (clip - S3_MEAN[:, None, :, :]) / S3_STD[:, None, :, :]
+                    accel, steer = model(clip[None].to(device))
+                    accel_targets.append(accel_map[row.accel_label])
+                    accel_predictions.append(int(accel.argmax(dim=1).item()))
+                    steer_targets.append(steer_map[row.steer_label])
+                    steer_predictions.append(int(steer.argmax(dim=1).item()))
+            valid_metric = (
+                macro_f1_score(accel_targets, accel_predictions, labels=range(len(ACCEL_LABELS)))
+                + macro_f1_score(steer_targets, steer_predictions, labels=range(len(STEER_LABELS)))
+            ) / 2.0
+        learning_rate = float(optimizer.param_groups[0]["lr"])
+        monitor_name = "valid_motion_macro_f1_group_holdout" if valid_metric is not None else "train_loss_proxy_no_validation"
+        monitor_value = valid_metric if valid_metric is not None else average_loss
+        logger.log(
+            epoch=epoch + 1,
+            train_loss=average_loss,
+            learning_rate=learning_rate,
+            valid_metric=valid_metric,
+            monitor_name=monitor_name,
+            monitor_value=monitor_value,
+        )
+        print(
+            f"[Stage3][epoch {epoch + 1}/{epochs}] loss={average_loss:.6f} "
+            f"lr={learning_rate:.3e} valid_motion_macro_f1="
+            f"{'unavailable' if valid_metric is None else f'{valid_metric:.6f}'}"
+        )
+        scheduler.step()
+        if early_stopping.step(monitor_value):
+            print(f"[Stage3] early stopping at epoch {epoch + 1}")
+            break
     checkpoint = output / "best.pt"
     torch.save({"model": model.state_dict()}, checkpoint)
-    del optimizer, model
+    del scheduler, optimizer, model, train_rows, valid_rows
     release_device_cache(device)
     return checkpoint
 

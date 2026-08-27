@@ -18,8 +18,10 @@ def main() -> int:
     parser.add_argument(
         "--stage3-frames-per-sample",
         type=int,
-        required=True,
-        help="Explicit source-frame count per official 0.1-second Stage 3 sample.",
+        help=(
+            "Optional override for the source-frame count per Stage 3 0.1-second sample. "
+            "Default: use round(cv2.CAP_PROP_FPS / 10) for each video."
+        ),
     )
     parser.add_argument("--stage1-sample-submission", type=Path)
     parser.add_argument("--stage2-sample-submission", type=Path)
