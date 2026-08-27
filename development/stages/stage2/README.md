@@ -4,6 +4,7 @@
 
 - 현재 구현: [`../../src/blackbox/stages/stage2/baseline.py`](../../src/blackbox/stages/stage2/baseline.py)
 - Iteration 2 연구용 스켈레톤·아키텍처 제안: [`ITERATION_2_SKELETON_AND_ARCHITECTURE.md`](./ITERATION_2_SKELETON_AND_ARCHITECTURE.md)
+- 다음 세션 인수인계/Iteration 3 계획: [`../../../STAGE2_ITERATION3_PLAN.md`](../../../STAGE2_ITERATION3_PLAN.md)
 - 작업 상태: [`../../TASKS.md`](../../TASKS.md)의 M4
 - 출력 계약: [`../../configs/submission_contract.json`](../../configs/submission_contract.json)
 
