@@ -7,7 +7,7 @@ import argparse
 import json
 from pathlib import Path
 
-from blackbox.experiment_config import config_path_value, load_experiment_config, section
+from blackbox.experiment_config import config_path_list, config_path_value, load_experiment_config, section
 from blackbox.submission_pipeline import generate_submission_bundle
 from blackbox.training import train_baseline
 from blackbox.training_control import TrainingControlConfig
@@ -24,6 +24,7 @@ def main() -> int:
     stage1 = section(config, "stage1")
     stage2 = section(config, "stage2")
     stage3 = section(config, "stage3")
+    inference = section(config, "inference")
     unsupported = [
         name
         for name, stage in (("stage2", stage2), ("stage3", stage3))
@@ -48,6 +49,7 @@ def main() -> int:
         early_stopping_min_delta=float(training.get("early_stopping_min_delta", 0.0)),
         validation_fraction=float(training.get("validation_fraction", 0.2)),
         log_dir=config_path_value(config_path, training.get("log_dir"), field="training.log_dir"),
+        use_amp=bool(training.get("use_amp", False)),
     )
     for stage in stages:
         train_baseline(
@@ -67,11 +69,24 @@ def main() -> int:
             processed_root=processed_root,
         )
     frames_per_sample = stage3.get("frames_per_sample")
+    configured_checkpoints = inference.get("checkpoints", {})
+    if not isinstance(configured_checkpoints, dict):
+        raise ValueError("inference.checkpoints must be a mapping")
+    checkpoint_paths = {
+        stage: config_path_list(
+            config_path,
+            configured_checkpoints.get(f"stage{stage}", []),
+            field=f"inference.checkpoints.stage{stage}",
+        )
+        for stage in (1, 2, 3)
+    }
     summary = generate_submission_bundle(
         inference_root,
         model_root,
         output_root,
         stage3_frames_per_sample=None if frames_per_sample is None else int(frames_per_sample),
+        smoothing_window=int(inference.get("smoothing_window", 1)),
+        checkpoint_paths={stage: paths for stage, paths in checkpoint_paths.items() if paths},
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

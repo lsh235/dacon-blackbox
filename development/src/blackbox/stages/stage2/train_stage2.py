@@ -15,7 +15,14 @@ import torch
 from torch.nn import functional as functional
 from torch.utils.data import DataLoader
 
-from blackbox.common.runtime import DEFAULT_SEED, choose_device, release_device_cache, seed_everything
+from blackbox.common.runtime import (
+    DEFAULT_SEED,
+    autocast_context,
+    choose_device,
+    make_grad_scaler,
+    release_device_cache,
+    seed_everything,
+)
 from blackbox.stages.stage2.dataset_stage2 import (
     IGNORE_INDEX,
     FarnebackConfig,
@@ -263,11 +270,14 @@ def train_stage2_window_epoch(
     optimizer: torch.optim.Optimizer,
     *,
     device: torch.device,
+    scaler: torch.amp.GradScaler | None = None,
+    use_amp: bool = False,
     target_config: TargetMappingConfig = TargetMappingConfig(),
 ) -> float:
     """Train one RGB+Flow epoch without retaining whole videos in memory."""
 
     model.train()
+    active_scaler = scaler or make_grad_scaler(device, enabled=use_amp)
     losses: list[float] = []
     for batch in loader:
         frames = batch["frames"].to(device, non_blocking=True)
@@ -277,12 +287,14 @@ def train_stage2_window_epoch(
             key: (value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value)
             for key, value in batch.items()
         }
-        loss = stage2_window_loss(
-            model(frames, flow, valid_lengths), tensor_batch, target_config=target_config
-        )
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
+        with autocast_context(device, enabled=use_amp):
+            loss = stage2_window_loss(
+                model(frames, flow, valid_lengths), tensor_batch, target_config=target_config
+            )
+        active_scaler.scale(loss).backward()
+        active_scaler.step(optimizer)
+        active_scaler.update()
         losses.append(float(loss.detach().cpu()))
     return sum(losses) / max(1, len(losses))
 
@@ -320,6 +332,7 @@ def fit_stage2_window_skeleton(
     )
     model = Stage2TwoStreamBiLSTM(frame_batch_size=config.frame_batch_size).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    scaler = make_grad_scaler(device, enabled=config.training_control.use_amp)
     scheduler = cosine_scheduler(
         optimizer,
         epochs=epochs,
@@ -334,7 +347,13 @@ def fit_stage2_window_skeleton(
     for epoch in range(epochs):
         hits_before, misses_before = dataset.flow_cache_hits, dataset.flow_cache_misses
         average_loss = train_stage2_window_epoch(
-            model, loader, optimizer, device=device, target_config=config.target_mapping
+            model,
+            loader,
+            optimizer,
+            device=device,
+            scaler=scaler,
+            use_amp=config.training_control.use_amp,
+            target_config=config.target_mapping,
         )
         learning_rate = float(optimizer.param_groups[0]["lr"])
         logger.log(
@@ -365,11 +384,15 @@ def fit_stage2_window_skeleton(
             "config": asdict(config),
             "farneback": asdict(config.farneback),
             "target_mapping": asdict(config.target_mapping),
+            "amp": {
+                "requested": config.training_control.use_amp,
+                "enabled": scaler.is_enabled(),
+            },
             "official_output": ["ID", "collision_frame", "entry_frame", "evasion_space", "entry_side"],
         },
         checkpoint,
     )
-    del dataset, loader, model, scheduler, optimizer
+    del dataset, loader, model, scaler, scheduler, optimizer
     release_device_cache(device)
     return checkpoint
 
@@ -394,6 +417,7 @@ def main() -> int:
     parser.add_argument("--early-stopping-patience", type=int)
     parser.add_argument("--early-stopping-min-delta", type=float)
     parser.add_argument("--log-dir", type=Path)
+    parser.add_argument("--use-amp", action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args()
     config: dict[str, object] = {}
     config_path: Path | None = None
@@ -439,6 +463,7 @@ def main() -> int:
                 early_stopping_min_delta=args.early_stopping_min_delta if args.early_stopping_min_delta is not None else float(training.get("early_stopping_min_delta", 0.0)),
                 validation_fraction=float(training.get("validation_fraction", 0.2)),
                 log_dir=log_dir,
+                use_amp=args.use_amp if args.use_amp is not None else bool(training.get("use_amp", False)),
             ),
         ),
     )

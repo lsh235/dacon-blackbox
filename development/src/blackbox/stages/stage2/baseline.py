@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
@@ -18,6 +19,7 @@ from blackbox.common.runtime import (
     choose_device,
     decode_video_frames,
     load_checkpoint,
+    make_grad_scaler,
     release_device_cache,
     seed_everything,
 )
@@ -110,7 +112,8 @@ def fit_stage2(
                 images = torch.stack(
                     [transform(Image.fromarray(frame)) for frame in frames[start : start + 64]]
                 ).to(device)
-                batches.append(backbone(images).float().cpu())
+                with autocast_context(device, enabled=training_control.use_amp):
+                    batches.append(backbone(images).float().cpu())
             sequences.append((str(row.ID), torch.cat(batches), min(int(row.t_collision), len(frames) - 1)))
 
     train_indices, valid_indices = group_holdout_indices(
@@ -122,6 +125,7 @@ def fit_stage2(
 
     temporal = Stage2Temporal().to(device)
     optimizer = torch.optim.AdamW(temporal.parameters(), lr=2e-4)
+    scaler = make_grad_scaler(device, enabled=training_control.use_amp)
     scheduler = cosine_scheduler(
         optimizer,
         epochs=epochs,
@@ -137,14 +141,16 @@ def fit_stage2(
         temporal.train()
         losses: list[float] = []
         for _, sequence, target in train_sequences:
-            collision, _, _ = temporal.logits(sequence[None].to(device))
-            loss = nn.functional.cross_entropy(
-                collision,
-                torch.tensor([target], dtype=torch.long, device=device),
-            )
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_context(device, enabled=training_control.use_amp):
+                collision, _, _ = temporal.logits(sequence[None].to(device))
+                loss = nn.functional.cross_entropy(
+                    collision,
+                    torch.tensor([target], dtype=torch.long, device=device),
+                )
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             losses.append(float(loss.detach().cpu()))
         average_loss = sum(losses) / max(1, len(losses))
         valid_metric: float | None = None
@@ -153,7 +159,8 @@ def fit_stage2(
             correct = 0
             with torch.inference_mode():
                 for _, sequence, target in valid_sequences:
-                    collision, _, _ = temporal.logits(sequence[None].to(device))
+                    with autocast_context(device, enabled=training_control.use_amp):
+                        collision, _, _ = temporal.logits(sequence[None].to(device))
                     correct += int(int(collision.argmax(dim=1).item()) == target)
             valid_metric = correct / len(valid_sequences)
         learning_rate = float(optimizer.param_groups[0]["lr"])
@@ -177,8 +184,17 @@ def fit_stage2(
             print(f"[Stage2] early stopping at epoch {epoch + 1}")
             break
     checkpoint = output / "best.pt"
-    torch.save({"model": temporal.state_dict()}, checkpoint)
-    del backbone, temporal, scheduler, optimizer, sequences, train_sequences, valid_sequences
+    torch.save(
+        {
+            "model": temporal.state_dict(),
+            "amp": {
+                "requested": training_control.use_amp,
+                "enabled": scaler.is_enabled(),
+            },
+        },
+        checkpoint,
+    )
+    del backbone, temporal, scaler, scheduler, optimizer, sequences, train_sequences, valid_sequences
     release_device_cache(device)
     return checkpoint, backbone_path
 
@@ -201,9 +217,17 @@ def frame_number(path: Path) -> int:
     return int(match.group(1)) if match else 0
 
 
-def predict_stage2(data_dir, model_dir):
+def score_stage2_checkpoint(
+    data_dir: str | Path,
+    checkpoint_path: str | Path,
+) -> list[dict[str, object]]:
+    """Return one fold's CPU probabilities and release all CUDA models."""
+
     device = choose_device(require_cuda=True)
-    model_root = Path(model_dir)
+    temporal_path = Path(checkpoint_path)
+    if temporal_path.is_dir():
+        temporal_path = temporal_path / "best.pt"
+    model_root = temporal_path.parent
     transform = ResNet18_Weights.IMAGENET1K_V1.transforms()
     backbone = resnet18(weights=None)
     backbone.load_state_dict(
@@ -216,7 +240,7 @@ def predict_stage2(data_dir, model_dir):
     backbone.to(device).eval()
     temporal = Stage2Temporal()
     temporal_checkpoint = load_checkpoint(
-        model_root / "best.pt",
+        temporal_path,
         required_keys=("model",),
     )
     temporal.load_state_dict(temporal_checkpoint["model"])
@@ -228,7 +252,7 @@ def predict_stage2(data_dir, model_dir):
     folders = sorted(path for path in image_root.iterdir() if path.is_dir())
     if not folders:
         raise ValueError(f"no Stage 2 image folders found: {image_root}")
-    rows = []
+    scores: list[dict[str, object]] = []
     with torch.inference_mode():
         for folder in folders:
             paths = sorted(
@@ -254,23 +278,58 @@ def predict_stage2(data_dir, model_dir):
                         backbone(images.to(device, non_blocking=True)).float().cpu()
                     )
             sequence = torch.cat(features)[None].to(device)
-            collision_index, entry_index, scene = temporal(sequence)
-            frame_numbers = [frame_number(path) for path in paths]
-            rows.append(
+            with autocast_context(device):
+                collision_logits, entry_logits, hidden = temporal.logits(sequence)
+                collision_index = collision_logits.argmax(dim=1)
+                entry_index = entry_logits.argmax(dim=1)
+                batch_index = torch.arange(len(hidden), device=hidden.device)
+                scene = temporal.scene(
+                    torch.cat(
+                        [hidden[batch_index, collision_index], hidden[batch_index, entry_index]],
+                        dim=1,
+                    )
+                )
+            scores.append(
                 {
                     "ID": folder.name,
-                    "collision_frame": frame_numbers[int(collision_index.item())],
-                    "entry_frame": frame_numbers[int(entry_index.item())],
-                    "evasion_space": int(scene[:, :2].argmax(dim=1).item()),
-                    "entry_side": "RIGHT"
-                    if int(scene[:, 2:].argmax(dim=1).item())
-                    else "LEFT",
+                    "frame_numbers": np.asarray([frame_number(path) for path in paths], dtype=np.int64),
+                    "collision_probabilities": torch.softmax(collision_logits, dim=1)[0].float().cpu().numpy(),
+                    "entry_probabilities": torch.softmax(entry_logits, dim=1)[0].float().cpu().numpy(),
+                    "evasion_probabilities": torch.softmax(scene[:, :2], dim=1)[0].float().cpu().numpy(),
+                    "entry_side_probabilities": torch.softmax(scene[:, 2:], dim=1)[0].float().cpu().numpy(),
                 }
             )
     del backbone, temporal
     release_device_cache(device)
+    return scores
+
+
+def stage2_scores_to_frame(scores: list[dict[str, object]]) -> pd.DataFrame:
+    """Convert averaged Stage 2 probabilities to the official columns."""
+
+    rows: list[dict[str, object]] = []
+    for score in scores:
+        frame_numbers = np.asarray(score["frame_numbers"])
+        collision = np.asarray(score["collision_probabilities"])
+        entry = np.asarray(score["entry_probabilities"])
+        evasion = np.asarray(score["evasion_probabilities"])
+        entry_side = np.asarray(score["entry_side_probabilities"])
+        rows.append(
+            {
+                "ID": str(score["ID"]),
+                "collision_frame": int(frame_numbers[int(collision.argmax())]),
+                "entry_frame": int(frame_numbers[int(entry.argmax())]),
+                "evasion_space": int(evasion.argmax()),
+                "entry_side": "RIGHT" if int(entry_side.argmax()) else "LEFT",
+            }
+        )
     frame = pd.DataFrame(
         rows,
         columns=["ID", "collision_frame", "entry_frame", "evasion_space", "entry_side"],
     )
     return validate_prediction_frame("stage2", frame)
+
+
+def predict_stage2(data_dir, model_dir):
+    scores = score_stage2_checkpoint(data_dir, Path(model_dir) / "best.pt")
+    return stage2_scores_to_frame(scores)

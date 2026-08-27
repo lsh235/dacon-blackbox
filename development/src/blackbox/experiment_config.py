@@ -38,6 +38,21 @@ def config_path_value(config_path: Path, value: str | Path | None, *, field: str
     return (config_path.parent / path).resolve() if not path.is_absolute() else path
 
 
+def config_path_list(config_path: Path, value: object, *, field: str) -> list[Path]:
+    """Resolve a YAML list of paths relative to its configuration file."""
+
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"config field {field} must be a list")
+    paths: list[Path] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, (str, Path)):
+            raise ValueError(f"config field {field}[{index}] must be a path string")
+        paths.append(config_path_value(config_path, item, field=f"{field}[{index}]"))
+    return paths
+
+
 def stage_paths(config: Mapping[str, Any], config_path: Path, stage: str) -> tuple[Path, Path, Path]:
     """Resolve data, model, and processed paths for one Stage training command."""
 

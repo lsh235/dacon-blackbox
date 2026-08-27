@@ -51,6 +51,7 @@ def main() -> int:
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
     parser.add_argument("--validation-fraction", type=float, default=0.2)
     parser.add_argument("--log-dir", type=Path)
+    parser.add_argument("--use-amp", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args()
     if args.epochs < 0:
         parser.error("--epochs must be >= 0")
@@ -79,6 +80,7 @@ def main() -> int:
             early_stopping_min_delta=args.early_stopping_min_delta,
             validation_fraction=args.validation_fraction,
             log_dir=args.log_dir,
+            use_amp=args.use_amp,
         ),
         processed_root=args.processed_root,
     )

@@ -21,13 +21,14 @@ DEFAULT_LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
 
 @dataclass(frozen=True)
 class TrainingControlConfig:
-    """Scheduler, stopping, and local JSONL logging settings."""
+    """Scheduler, stopping, AMP, and local JSONL logging settings."""
 
     min_learning_rate: float = 1e-6
     early_stopping_patience: int = 5
     early_stopping_min_delta: float = 0.0
     validation_fraction: float = 0.2
     log_dir: str | Path | None = None
+    use_amp: bool = False
 
     def __post_init__(self) -> None:
         if self.min_learning_rate < 0.0:
@@ -38,6 +39,8 @@ class TrainingControlConfig:
             raise ValueError("early_stopping_min_delta must be >= 0")
         if not 0.0 <= self.validation_fraction < 1.0:
             raise ValueError("validation_fraction must be in [0, 1)")
+        if not isinstance(self.use_amp, bool):
+            raise TypeError("use_amp must be a boolean")
 
 
 class JsonlTrainingLogger:

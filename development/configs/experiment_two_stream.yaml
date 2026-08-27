@@ -11,6 +11,7 @@ run:
   stages: [1, 2, 3]
 
 training:
+  use_amp: true
   min_learning_rate: 0.000001
   early_stopping_patience: 4
   early_stopping_min_delta: 0.0001
@@ -51,3 +52,10 @@ stage3:
 preprocessing:
   stage1_slots: 1
   max_windows_per_video: null
+
+inference:
+  smoothing_window: 3
+  checkpoints:
+    stage1: []
+    stage2: []
+    stage3: []

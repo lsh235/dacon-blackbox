@@ -21,6 +21,7 @@ from blackbox.common.runtime import (
     center_clip,
     choose_device,
     load_checkpoint,
+    make_grad_scaler,
     release_device_cache,
     seed_everything,
     video_paths,
@@ -79,6 +80,7 @@ def fit_stage3(
     device = choose_device()
     model = Stage3MViT().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    scaler = make_grad_scaler(device, enabled=training_control.use_amp)
     scheduler = cosine_scheduler(
         optimizer,
         epochs=epochs,
@@ -100,18 +102,20 @@ def fit_stage3(
                 center=int(row.frame_index),
             )
             clip = (clip - S3_MEAN[:, None, :, :]) / S3_STD[:, None, :, :]
-            accel, steer = model(clip[None].to(device))
-            loss = nn.functional.cross_entropy(
-                accel,
-                torch.tensor([accel_map[row.accel_label]], dtype=torch.long, device=device),
-            )
-            loss += nn.functional.cross_entropy(
-                steer,
-                torch.tensor([steer_map[row.steer_label]], dtype=torch.long, device=device),
-            )
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_context(device, enabled=training_control.use_amp):
+                accel, steer = model(clip[None].to(device))
+                loss = nn.functional.cross_entropy(
+                    accel,
+                    torch.tensor([accel_map[row.accel_label]], dtype=torch.long, device=device),
+                )
+                loss += nn.functional.cross_entropy(
+                    steer,
+                    torch.tensor([steer_map[row.steer_label]], dtype=torch.long, device=device),
+                )
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             losses.append(float(loss.detach().cpu()))
         average_loss = sum(losses) / max(1, len(losses))
         valid_metric: float | None = None
@@ -129,7 +133,8 @@ def fit_stage3(
                         center=int(row.frame_index),
                     )
                     clip = (clip - S3_MEAN[:, None, :, :]) / S3_STD[:, None, :, :]
-                    accel, steer = model(clip[None].to(device))
+                    with autocast_context(device, enabled=training_control.use_amp):
+                        accel, steer = model(clip[None].to(device))
                     accel_targets.append(accel_map[row.accel_label])
                     accel_predictions.append(int(accel.argmax(dim=1).item()))
                     steer_targets.append(steer_map[row.steer_label])
@@ -159,8 +164,17 @@ def fit_stage3(
             print(f"[Stage3] early stopping at epoch {epoch + 1}")
             break
     checkpoint = output / "best.pt"
-    torch.save({"model": model.state_dict()}, checkpoint)
-    del scheduler, optimizer, model, train_rows, valid_rows
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "amp": {
+                "requested": training_control.use_amp,
+                "enabled": scaler.is_enabled(),
+            },
+        },
+        checkpoint,
+    )
+    del scaler, scheduler, optimizer, model, train_rows, valid_rows
     release_device_cache(device)
     return checkpoint
 
@@ -190,10 +204,18 @@ def _decode_frames(path: Path) -> torch.Tensor:
     return torch.stack(frames)
 
 
-def predict_stage3(data_dir, model_dir):
+def score_stage3_checkpoint(
+    data_dir: str | Path,
+    checkpoint_path: str | Path,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Return raw-frame probabilities for one fold, then release its model."""
+
     device = choose_device(require_cuda=True)
+    model_path = Path(checkpoint_path)
+    if model_path.is_dir():
+        model_path = model_path / "best.pt"
     checkpoint = load_checkpoint(
-        Path(model_dir) / "best.pt",
+        model_path,
         required_keys=("model",),
     )
     model = Stage3MViT()
@@ -201,14 +223,14 @@ def predict_stage3(data_dir, model_dir):
     model.to(device).eval()
     videos = video_paths(Path(data_dir) / "videos")
     batch_size = max(1, int(os.getenv("BLACKBOX_STAGE3_BATCH_SIZE", "8")))
-    rows = []
+    scores: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     with torch.inference_mode():
         for path in videos:
             frames = _decode_frames(path)
             frame_count = len(frames)
             centers = np.arange(frame_count)
-            accel_predictions: list[int] = []
-            steer_predictions: list[int] = []
+            accel_probabilities: list[torch.Tensor] = []
+            steer_probabilities: list[torch.Tensor] = []
             for start in range(0, frame_count, batch_size):
                 center = centers[start : start + batch_size]
                 indices = np.clip(
@@ -225,23 +247,45 @@ def predict_stage3(data_dir, model_dir):
                 ) / S3_STD[None, :, None, :, :]
                 with autocast_context(device):
                     accel_logits, steer_logits = model(clips.to(device, non_blocking=True))
-                accel_predictions.extend(accel_logits.argmax(dim=1).cpu().tolist())
-                steer_predictions.extend(steer_logits.argmax(dim=1).cpu().tolist())
-            for sample_index, (accel, steer) in enumerate(
-                zip(accel_predictions, steer_predictions)
-            ):
-                rows.append(
-                    {
-                        "ID": path.stem,
-                        "sample_index": sample_index,
-                        "accel_label": ACCEL_LABELS[accel],
-                        "steer_label": STEER_LABELS[steer],
-                    }
-                )
+                accel_probabilities.append(torch.softmax(accel_logits, dim=1).float().cpu())
+                steer_probabilities.append(torch.softmax(steer_logits, dim=1).float().cpu())
+            scores[path.stem] = (
+                torch.cat(accel_probabilities).numpy(),
+                torch.cat(steer_probabilities).numpy(),
+            )
     del model
     release_device_cache(device)
+    return scores
+
+
+def stage3_scores_to_frame(
+    scores: dict[str, tuple[np.ndarray, np.ndarray]],
+) -> pd.DataFrame:
+    """Convert raw-frame or 10 Hz probability sequences to class labels."""
+
+    rows: list[dict[str, object]] = []
+    for video_id in sorted(scores):
+        accel_probabilities, steer_probabilities = scores[video_id]
+        accel_predictions = accel_probabilities.argmax(axis=1)
+        steer_predictions = steer_probabilities.argmax(axis=1)
+        rows.extend(
+            {
+                "ID": video_id,
+                "sample_index": sample_index,
+                "accel_label": ACCEL_LABELS[int(accel)],
+                "steer_label": STEER_LABELS[int(steer)],
+            }
+            for sample_index, (accel, steer) in enumerate(
+                zip(accel_predictions, steer_predictions, strict=True)
+            )
+        )
     frame = pd.DataFrame(
         rows,
         columns=["ID", "sample_index", "accel_label", "steer_label"],
     )
     return validate_prediction_frame("stage3", frame)
+
+
+def predict_stage3(data_dir, model_dir):
+    scores = score_stage3_checkpoint(data_dir, Path(model_dir) / "best.pt")
+    return stage3_scores_to_frame(scores)

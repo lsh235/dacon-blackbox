@@ -22,6 +22,7 @@ def main() -> int:
     parser.add_argument("--early-stopping-min-delta", type=float)
     parser.add_argument("--validation-fraction", type=float)
     parser.add_argument("--log-dir", type=Path)
+    parser.add_argument("--use-amp", action=argparse.BooleanOptionalAction, default=None)
     args = parser.parse_args()
     config: dict[str, object] = {}
     config_path: Path | None = None
@@ -69,6 +70,7 @@ def main() -> int:
                 args.validation_fraction if args.validation_fraction is not None else float(training.get("validation_fraction", 0.2))
             ),
             log_dir=log_dir,
+            use_amp=args.use_amp if args.use_amp is not None else bool(training.get("use_amp", False)),
         ),
     )
     print(f"[OK] checkpoint: {checkpoint}")

@@ -45,10 +45,18 @@ def choose_device(*, require_cuda: bool = False) -> torch.device:
     return torch.device("cpu")
 
 
-def autocast_context(device: torch.device):
-    if device.type == "cuda":
+def autocast_context(device: torch.device, *, enabled: bool = True):
+    """Return CUDA FP16 autocast when requested and available."""
+
+    if enabled and device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.float16)
     return nullcontext()
+
+
+def make_grad_scaler(device: torch.device, *, enabled: bool) -> torch.amp.GradScaler:
+    """Create a GradScaler that becomes a no-op outside CUDA AMP training."""
+
+    return torch.amp.GradScaler("cuda", enabled=bool(enabled and device.type == "cuda"))
 
 
 def release_device_cache(device: torch.device) -> None:

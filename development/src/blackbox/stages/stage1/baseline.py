@@ -18,6 +18,7 @@ from blackbox.common.runtime import (
     autocast_context,
     choose_device,
     load_checkpoint,
+    make_grad_scaler,
     release_device_cache,
     seed_everything,
     video_paths,
@@ -177,6 +178,7 @@ def fit_stage1(
     )
     model = Stage1MViT(feature_mode=feature_mode).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    scaler = make_grad_scaler(device, enabled=training_control.use_amp)
     criterion = FocalLoss(gamma=focal_gamma)
     scheduler = cosine_scheduler(
         optimizer,
@@ -195,10 +197,12 @@ def fit_stage1(
         for clips, targets in loader:
             clips = clips.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
-            loss = criterion(model(clips), targets)
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            with autocast_context(device, enabled=training_control.use_amp):
+                loss = criterion(model(clips), targets)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             losses.append(float(loss.detach().cpu()))
         average_loss = sum(losses) / max(1, len(losses))
         valid_metric: float | None = None
@@ -208,7 +212,8 @@ def fit_stage1(
             valid_predictions: list[int] = []
             with torch.inference_mode():
                 for clips, targets in validation_loader:
-                    logits = model(clips.to(device, non_blocking=True))
+                    with autocast_context(device, enabled=training_control.use_amp):
+                        logits = model(clips.to(device, non_blocking=True))
                     valid_targets.extend(targets.tolist())
                     valid_predictions.extend(logits.argmax(dim=1).cpu().tolist())
             valid_metric = macro_f1_score(valid_targets, valid_predictions, labels=range(2))
@@ -252,28 +257,32 @@ def fit_stage1(
                 if augmentation is not None
                 else {"enabled": False}
             ),
+            "amp": {
+                "requested": training_control.use_amp,
+                "enabled": scaler.is_enabled(),
+            },
         },
         checkpoint,
     )
-    del criterion, dataset, loader, validation_loader, scheduler, optimizer, model
+    del criterion, dataset, loader, validation_loader, scaler, scheduler, optimizer, model
     release_device_cache(device)
     return checkpoint
 
 
-def score_stage1_videos(
+def score_stage1_checkpoint(
     videos: Sequence[str | Path],
-    model_dir: str | Path,
+    checkpoint_path: str | Path,
     *,
     tta_slots: int | None = None,
 ) -> list[float]:
-    """Average RERECORDED probabilities over early/middle/late video slots."""
+    """Score one fold and release it before another checkpoint is loaded."""
 
     paths = [Path(video) for video in videos]
     if not paths:
         raise ValueError("Stage 1 scoring requires at least one video")
     device = choose_device(require_cuda=True)
     checkpoint = load_checkpoint(
-        Path(model_dir) / "best.pt",
+        checkpoint_path,
         required_keys=("model", "size", "frames"),
     )
     size = int(checkpoint["size"])
@@ -324,6 +333,21 @@ def score_stage1_videos(
     del model
     release_device_cache(device)
     return [float(np.mean(values)) if values else 1.0 for values in scores]
+
+
+def score_stage1_videos(
+    videos: Sequence[str | Path],
+    model_dir: str | Path,
+    *,
+    tta_slots: int | None = None,
+) -> list[float]:
+    """Average RERECORDED probabilities over early/middle/late video slots."""
+
+    return score_stage1_checkpoint(
+        videos,
+        Path(model_dir) / "best.pt",
+        tta_slots=tta_slots,
+    )
 
 
 def predict_stage1(data_dir, model_dir):

@@ -5,7 +5,7 @@ from __future__ import annotations
 import gc
 import json
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from time import perf_counter
 
@@ -14,6 +14,11 @@ import torch
 
 from blackbox.common.runtime import video_paths
 from blackbox.contracts import STAGE_COLUMNS, validate_prediction_frame
+from blackbox.ensemble_inference import (
+    predict_stage1_ensemble,
+    predict_stage2_ensemble,
+    predict_stage3_ensemble,
+)
 from blackbox.inference import predict_stage1, predict_stage2, predict_stage3
 from blackbox.stages.stage2.dataset_stage2 import video_frame_count
 from blackbox.stages.stage3.dataset_stage3 import read_stage3_time_axis
@@ -226,6 +231,8 @@ def generate_submission_bundle(
     output_root: str | Path,
     *,
     stage3_frames_per_sample: int | None = None,
+    smoothing_window: int = 1,
+    checkpoint_paths: Mapping[int, Sequence[str | Path]] | None = None,
     sample_submissions: Mapping[int, str | Path] | None = None,
     predictors: Mapping[int, StagePredictor] = DEFAULT_PREDICTORS,
 ) -> dict[str, object]:
@@ -239,15 +246,22 @@ def generate_submission_bundle(
 
     if stage3_frames_per_sample is not None and stage3_frames_per_sample < 1:
         raise ValueError("stage3_frames_per_sample must be >= 1")
+    if smoothing_window < 1 or smoothing_window % 2 == 0:
+        raise ValueError("smoothing_window must be a positive odd integer")
     root = Path(data_root)
     models = Path(model_root)
     output = Path(output_root)
     output.mkdir(parents=True, exist_ok=True)
     samples = sample_submissions or {}
+    ensembles = {stage: list(paths) for stage, paths in (checkpoint_paths or {}).items()}
+    if set(ensembles) - {1, 2, 3}:
+        raise ValueError("checkpoint_paths may contain only Stage 1, 2, and 3")
     summary: dict[str, object] = {
         "fallback_stages": [],
         "stages": {},
         "stage3_time_axis_mode": "explicit_override" if stage3_frames_per_sample is not None else "cap_prop_fps",
+        "stage3_smoothing_window": smoothing_window,
+        "ensemble_checkpoints": {},
     }
 
     for stage in (1, 2, 3):
@@ -257,10 +271,27 @@ def generate_submission_bundle(
         expected_ids = _expected_ids(stage, stage_data)
         started = perf_counter()
         error: str | None = None
+        configured_checkpoints = ensembles.get(stage, [])
+        if stage == 3 and smoothing_window > 1 and not configured_checkpoints:
+            configured_checkpoints = [models / stage_name / "best.pt"]
+        if configured_checkpoints:
+            summary["ensemble_checkpoints"][stage_name] = [str(path) for path in configured_checkpoints]
         try:
-            prediction = predictors[stage](stage_data, models / stage_name)
+            if stage == 1 and configured_checkpoints:
+                prediction = predict_stage1_ensemble(stage_data, configured_checkpoints)
+            elif stage == 2 and configured_checkpoints:
+                prediction = predict_stage2_ensemble(stage_data, configured_checkpoints)
+            elif stage == 3 and configured_checkpoints:
+                prediction, time_axes = predict_stage3_ensemble(
+                    stage_data,
+                    configured_checkpoints,
+                    smoothing_window=smoothing_window,
+                    frames_per_sample=stage3_frames_per_sample,
+                )
+            else:
+                prediction = predictors[stage](stage_data, models / stage_name)
             prediction = validate_prediction_frame(stage_name, prediction)
-            if stage == 3:
+            if stage == 3 and not configured_checkpoints:
                 prediction, time_axes = project_stage3_source_frames_by_video_fps(
                     prediction,
                     video_dir=stage_data / "videos",
@@ -289,9 +320,11 @@ def generate_submission_bundle(
             "output": str(path),
             "elapsed_seconds": round(perf_counter() - started, 3),
             "fallback": error,
+            "ensemble_size": len(configured_checkpoints) if configured_checkpoints else 1,
         }
         if stage == 3 and error is None:
             stage_summary["time_axes"] = time_axes
+            stage_summary["smoothing_window"] = smoothing_window
         summary["stages"][stage_name] = stage_summary
 
     manifest = output / "submission_manifest.json"

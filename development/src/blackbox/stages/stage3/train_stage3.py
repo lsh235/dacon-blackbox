@@ -10,7 +10,14 @@ import torch
 from torch.nn import functional as functional
 from torch.utils.data import DataLoader
 
-from blackbox.common.runtime import DEFAULT_SEED, choose_device, release_device_cache, seed_everything
+from blackbox.common.runtime import (
+    DEFAULT_SEED,
+    autocast_context,
+    choose_device,
+    make_grad_scaler,
+    release_device_cache,
+    seed_everything,
+)
 from blackbox.stages.stage3.baseline import fit_stage3
 from blackbox.stages.stage3.dataset_stage3 import (
     IGNORE_INDEX,
@@ -74,6 +81,8 @@ def _run_epoch(
     *,
     device: torch.device,
     optimizer: torch.optim.Optimizer | None,
+    scaler: torch.amp.GradScaler | None,
+    use_amp: bool,
 ) -> float | None:
     training = optimizer is not None
     model.train(training)
@@ -85,18 +94,23 @@ def _run_epoch(
                 key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
                 for key, value in batch.items()
             }
-            predictions = model(
-                tensor_batch["frames"],
-                tensor_batch["flow"],
-                tensor_batch["valid_length"],
-            )
-            loss = stage3_sequence_loss(predictions, tensor_batch)
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
+            with autocast_context(device, enabled=use_amp):
+                predictions = model(
+                    tensor_batch["frames"],
+                    tensor_batch["flow"],
+                    tensor_batch["valid_length"],
+                )
+                loss = stage3_sequence_loss(predictions, tensor_batch)
             if loss is None:
                 continue
             if optimizer is not None:
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
+                if scaler is None:
+                    raise RuntimeError("training requires a GradScaler")
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
             losses.append(float(loss.detach().cpu()))
     return sum(losses) / len(losses) if losses else None
 
@@ -164,6 +178,7 @@ def fit_stage3_two_stream_skeleton(
     )
     model = Stage3TwoStreamBiLSTM(frame_batch_size=config.frame_batch_size).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    scaler = make_grad_scaler(device, enabled=config.training_control.use_amp)
     scheduler = cosine_scheduler(
         optimizer,
         epochs=epochs,
@@ -176,10 +191,28 @@ def fit_stage3_two_stream_skeleton(
         min_delta=config.training_control.early_stopping_min_delta,
     )
     for epoch in range(epochs):
-        average_loss = _run_epoch(model, train_loader, device=device, optimizer=optimizer)
+        average_loss = _run_epoch(
+            model,
+            train_loader,
+            device=device,
+            optimizer=optimizer,
+            scaler=scaler,
+            use_amp=config.training_control.use_amp,
+        )
         if average_loss is None:
             raise ValueError("Stage 3 Two-Stream training found no sparse targets in its windows")
-        valid_metric = _run_epoch(model, valid_loader, device=device, optimizer=None) if valid_loader else None
+        valid_metric = (
+            _run_epoch(
+                model,
+                valid_loader,
+                device=device,
+                optimizer=None,
+                scaler=None,
+                use_amp=config.training_control.use_amp,
+            )
+            if valid_loader
+            else None
+        )
         learning_rate = float(optimizer.param_groups[0]["lr"])
         monitor_name = "valid_sparse_ce_group_holdout" if valid_metric is not None else "train_loss_proxy_no_validation"
         monitor_value = valid_metric if valid_metric is not None else average_loss
@@ -209,13 +242,16 @@ def fit_stage3_two_stream_skeleton(
             "format": "experimental_stage3_two_stream_farneback_bilstm_10hz",
             "config": asdict(config),
             "time_axis": "round(cv2.CAP_PROP_FPS / 10) per video",
+            "amp": {
+                "requested": config.training_control.use_amp,
+                "enabled": scaler.is_enabled(),
+            },
         },
         checkpoint,
     )
-    del valid_loader, valid_dataset, train_loader, train_dataset, scheduler, optimizer, model
+    del valid_loader, valid_dataset, train_loader, train_dataset, scaler, scheduler, optimizer, model
     release_device_cache(device)
     return checkpoint
-from blackbox.training_control import TrainingControlConfig
 
 
 def main() -> int:
@@ -230,6 +266,7 @@ def main() -> int:
     parser.add_argument("--early-stopping-min-delta", type=float)
     parser.add_argument("--validation-fraction", type=float)
     parser.add_argument("--log-dir", type=Path)
+    parser.add_argument("--use-amp", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--window-frames", type=int)
     parser.add_argument("--stride", type=int)
     parser.add_argument("--size", type=int)
@@ -264,6 +301,7 @@ def main() -> int:
         early_stopping_min_delta=args.early_stopping_min_delta if args.early_stopping_min_delta is not None else float(training.get("early_stopping_min_delta", 0.0)),
         validation_fraction=args.validation_fraction if args.validation_fraction is not None else float(training.get("validation_fraction", 0.2)),
         log_dir=log_dir,
+        use_amp=args.use_amp if args.use_amp is not None else bool(training.get("use_amp", False)),
     )
     architecture = args.architecture or str(stage.get("architecture", "baseline"))
     epochs = args.epochs if args.epochs is not None else int(config.get("run", {}).get("epochs", 1))
