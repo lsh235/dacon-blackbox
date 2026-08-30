@@ -33,16 +33,32 @@ def main() -> int:
     parser.add_argument("--processed-root", type=Path, default=DEFAULT_PROCESSED_ROOT)
     parser.add_argument("--stages", nargs="+", choices=("stage1", "stage2", "stage3"), default=("stage1", "stage2", "stage3"))
     parser.add_argument("--size", type=int, default=224)
-    parser.add_argument("--stage1-frames", type=int, default=16)
-    parser.add_argument("--stage1-slots", type=int, default=1)
+    parser.add_argument(
+        "--stage1-frames",
+        type=int,
+        default=32,
+        help="Cached Stage 1 central-region length; v3 training requires 32.",
+    )
+    parser.add_argument("--stage1-slots", type=int, default=3)
+    parser.add_argument("--stage1-jitter-frames", type=int, default=4)
+    parser.add_argument("--stage1-forensic-size", type=int, default=320)
     parser.add_argument("--stage1-feature-mode", choices=("rgb", "rgb_fft"), default="rgb_fft")
     parser.add_argument("--window-frames", type=int, default=64)
     parser.add_argument("--stride", type=int, default=32)
     parser.add_argument("--max-windows-per-video", type=int)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
-    if min(args.size, args.stage1_frames, args.stage1_slots, args.window_frames, args.stride) < 1:
+    if min(
+        args.size,
+        args.stage1_frames,
+        args.stage1_slots,
+        args.stage1_forensic_size,
+        args.window_frames,
+        args.stride,
+    ) < 1:
         parser.error("size, frame, slot, window, and stride values must be >= 1")
+    if args.stage1_jitter_frames < 0:
+        parser.error("--stage1-jitter-frames must be >= 0")
     if args.max_windows_per_video is not None and args.max_windows_per_video < 1:
         parser.error("--max-windows-per-video must be >= 1")
 
@@ -60,6 +76,8 @@ def main() -> int:
             size=args.size,
             frames=args.stage1_frames,
             slots=args.stage1_slots,
+            jitter_frames=args.stage1_jitter_frames,
+            forensic_size=args.stage1_forensic_size,
             feature_mode=args.stage1_feature_mode,
             overwrite=args.overwrite,
         )

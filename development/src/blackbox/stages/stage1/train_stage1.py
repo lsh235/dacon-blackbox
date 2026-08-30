@@ -17,6 +17,11 @@ def main() -> int:
     parser.add_argument("--model-dir", type=Path)
     parser.add_argument("--processed-root", type=Path)
     parser.add_argument("--epochs", type=int)
+    parser.add_argument(
+        "--pretrained-backbone-checkpoint",
+        type=Path,
+        help="Optional local MViTv2-S state_dict; omitted means random initialization.",
+    )
     parser.add_argument("--min-learning-rate", type=float)
     parser.add_argument("--early-stopping-patience", type=int)
     parser.add_argument("--early-stopping-min-delta", type=float)
@@ -47,12 +52,47 @@ def main() -> int:
     checkpoint = fit_stage1(
         data_dir,
         model_dir,
-        epochs=args.epochs if args.epochs is not None else int(config.get("run", {}).get("epochs", 1)),
+        epochs=(
+            args.epochs
+            if args.epochs is not None
+            else int(stage.get("epochs", config.get("run", {}).get("epochs", 30)))
+        ),
+        minimum_epochs=int(stage.get("minimum_epochs", 10)),
+        early_stopping_patience=(
+            args.early_stopping_patience
+            if args.early_stopping_patience is not None
+            else int(stage.get("early_stopping_patience", 7))
+        ),
+        warmup_epochs=int(stage.get("warmup_epochs", 3)),
+        backbone_learning_rate=float(stage.get("backbone_learning_rate", 1e-5)),
+        auxiliary_learning_rate=float(stage.get("auxiliary_learning_rate", 1e-4)),
+        warmup_initial_learning_rate=float(
+            stage.get("warmup_initial_learning_rate", 1e-6)
+        ),
+        pretrained_backbone_checkpoint=args.pretrained_backbone_checkpoint,
         feature_mode=str(stage.get("feature_mode", "rgb_fft")),
         focal_gamma=float(stage.get("focal_gamma", 2.0)),
+        frame_classification_weight=float(stage.get("frame_classification_weight", 0.25)),
+        smoothing_weight=float(stage.get("smoothing_weight", 0.05)),
+        smoothing_truncation=float(stage.get("smoothing_truncation", 4.0)),
+        explainability_weight=float(stage.get("explainability_weight", 0.05)),
+        mask_regularization_weight=float(stage.get("mask_regularization_weight", 0.02)),
+        mask_sparsity_weight=float(stage.get("mask_sparsity_weight", 1e-3)),
+        training_sequence_lengths=tuple(
+            int(value) for value in stage.get("training_sequence_lengths", (16, 24, 32))
+        ),
+        motion_iterations=int(stage.get("motion_iterations", 3)),
+        correlation_radius=int(stage.get("correlation_radius", 2)),
         size=int(stage.get("size", 224)),
         frames=int(stage.get("frames", 16)),
         batch_size=int(stage.get("batch_size", 1)),
+        train_slots=int(stage.get("train_slots", 3)),
+        jitter_frames=int(stage.get("jitter_frames", 4)),
+        random_temporal_jitter=bool(stage.get("random_temporal_jitter", True)),
+        forensic_size=int(stage.get("forensic_size", 320)),
+        fft_size=int(stage.get("fft_size", 112)),
+        row_profile_bins=int(stage.get("row_profile_bins", 16)),
+        num_workers=int(stage.get("num_workers", 0)),
         enable_augmentation=bool(stage.get("augmentation", True)),
         inference_tta_slots=int(stage.get("inference_tta_slots", 3)),
         processed_root=processed_root,
@@ -61,7 +101,7 @@ def main() -> int:
                 args.min_learning_rate if args.min_learning_rate is not None else float(training.get("min_learning_rate", 1e-6))
             ),
             early_stopping_patience=(
-                args.early_stopping_patience if args.early_stopping_patience is not None else int(training.get("early_stopping_patience", 5))
+                args.early_stopping_patience if args.early_stopping_patience is not None else int(stage.get("early_stopping_patience", 7))
             ),
             early_stopping_min_delta=(
                 args.early_stopping_min_delta if args.early_stopping_min_delta is not None else float(training.get("early_stopping_min_delta", 0.0))

@@ -14,11 +14,12 @@
 
 | 항목 | 현재 구현 | 확인할 위치 |
 | --- | --- | --- |
-| 모델 | `mvit_v2_s(weights=None)`의 분류 헤드를 2클래스로 교체 | `Stage1MViT.__init__` |
-| 학습 입력 | 영상 전체에서 균등하게 뽑은 16프레임, 224×224 | `fit_stage1`, `center_clip` |
-| 추론 입력 | 영상을 3구간으로 나누고 구간마다 16프레임 디코딩 | `_clip_ids`, `_Stage1Clips` |
-| 전처리 | 짧은 변을 224로 리사이즈, 중앙 크롭, 평균 0.45·표준편차 0.225 | `crop_tensor`, `_decode_clip` |
-| 집계 | 각 구간의 `RERECORDED` softmax 확률 평균 | `predict_stage1` |
+| 모델 | RGB MViTv2-S + FFT 2-D CNN + Flicker Dilated Conv1d + 4-D Correlation/Tied ConvGRU fusion | `Stage1MViT.__init__` |
+| 보조 학습 | frame Focal + truncated smoothing + masked reconstruction + BCE-to-one mask regularization | `Stage1MultiTaskLoss` |
+| 학습 입력 | 초반·중반·후반에서 연속 16프레임, 시작점 random jitter | `Stage1TrainingDataset` |
+| 추론 입력 | 동일 3구간에서 중앙 연속 16프레임 | `Stage1InferenceDataset` |
+| 전처리 | RGB 224 crop, 별도 320 forensic crop, 증강 후 FFT·flicker 계산 | `prepare_stage1_inputs` |
+| 집계 | 각 구간의 `RERECORDED` softmax 확률 평균 | `score_stage1_checkpoint` |
 | 결정 | 평균 확률이 0.5 이상이면 `RERECORDED` | `predict_stage1` |
 | 오류 정책 | 모든 구간 디코딩 실패 시 `RERECORDED` | `_Stage1Clips`, `predict_stage1` |
 
@@ -27,7 +28,7 @@
 1. `weights=None`이므로 현재 모델은 사전학습 가중치를 사용하지 않는다.
 2. 현재 1 epoch 실행 결과는 역전파·체크포인트·추론 계약을 검증한 스모크이지 성능 측정값이 아니다.
 3. 공개 Stage 1 예제는 원본 5개와 특성을 모사한 파생 재녹화 5개뿐이며 실제 기기로 재촬영한 검증셋이 아니다.
-4. 학습의 전 구간 균등 샘플과 추론의 3개 국소 구간 샘플은 시간 분포가 다르다. 성능 실험 전에 이 차이를 의도한 설계인지 검증해야 한다.
+4. 학습·검증·추론은 같은 3구간 정책을 사용하지만, clip 길이·jitter 폭은 고정 Group CV에서 별도로 비교해야 한다.
 5. 사전학습 가중치와 외부·합성 데이터의 사용 허용 여부는 아직 공식 확인되지 않았다. 확인 전에는 최종 학습에 넣지 않는다.
 
 ## 2. 이해를 위해 공부할 주제
@@ -151,7 +152,7 @@
 4. class weight 또는 balanced sampler
 5. learning rate, weight decay, warmup, scheduler, epoch와 early stopping
 
-모든 실험은 같은 split, seed 목록, clip 수, 해상도와 지표를 사용한다. AMP는 현재 추론에 적용되지만 학습에는 적용되지 않는다. 학습 AMP 적용 시 속도·VRAM뿐 아니라 지표와 수치 안정성도 함께 기록한다.
+모든 실험은 같은 split, seed 목록, clip 수, 해상도와 지표를 사용한다. AMP는 학습과 추론에 적용되며, 속도·VRAM뿐 아니라 지표와 수치 안정성도 함께 기록한다.
 
 ### P2. 시간 샘플링과 video-level 집계
 

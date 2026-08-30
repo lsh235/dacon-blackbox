@@ -47,4 +47,4 @@ GPU VRAM: 44.7GiB
 CPU: 7 vCPU
 CPU RAM: 60GB
 공유 메모리: 30GB
-자세한 사항은 [**평가 탭**](./Evaluation.yaml)과 [**코드 제출 가이드**](Evaluation.yaml)를 반드시 참고하여 진행하시길 바랍니다.
+자세한 사항은 [**평가 탭**](./Evaluation.md)과 [**코드 제출 가이드**](./Evaluation.md)를 반드시 참고하여 진행하시길 바랍니다.

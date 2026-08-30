@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import json
 from pathlib import Path
+from collections.abc import Mapping
 from typing import Hashable, Iterable, Literal
 
 import torch
@@ -61,6 +62,8 @@ class JsonlTrainingLogger:
         valid_metric: float | None,
         monitor_name: str,
         monitor_value: float,
+        valid_loss: float | None = None,
+        diagnostics: Mapping[str, float | int | bool | None] | None = None,
     ) -> None:
         payload = {
             "timestamp_utc": datetime.now(UTC).isoformat(),
@@ -71,7 +74,13 @@ class JsonlTrainingLogger:
             "learning_rate": float(learning_rate),
             "monitor_name": monitor_name,
             "monitor_value": float(monitor_value),
+            "valid_loss": None if valid_loss is None else float(valid_loss),
         }
+        if diagnostics is not None:
+            for name, value in diagnostics.items():
+                if name in payload:
+                    raise ValueError(f"training diagnostic collides with reserved field: {name}")
+                payload[name] = value
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
 

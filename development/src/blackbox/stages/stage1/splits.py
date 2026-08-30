@@ -12,6 +12,11 @@ from blackbox.evaluation.stage1 import STAGE1_LABELS
 
 
 GROUP_COLUMN_CANDIDATES = (
+    "session_id",
+    "capture_session_id",
+    "device_id",
+    "capture_device_id",
+    "camera_id",
     "source_content_id",
     "scene_id",
     "original_video_id",

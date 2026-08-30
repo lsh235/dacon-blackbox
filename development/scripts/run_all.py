@@ -16,6 +16,11 @@ from blackbox.training_control import TrainingControlConfig
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--stage1-pretrained-backbone-checkpoint",
+        type=Path,
+        help="Optional explicit local MViTv2-S state_dict path.",
+    )
     args = parser.parse_args()
     config, config_path = load_experiment_config(args.config)
     data = section(config, "data")
@@ -57,14 +62,55 @@ def main() -> int:
             model_root,
             stages=(stage,),
             epochs=int(run.get("epochs", 1)),
+            stage1_epochs=int(stage1.get("epochs", 30)),
+            stage1_minimum_epochs=int(stage1.get("minimum_epochs", 10)),
+            stage1_early_stopping_patience=int(
+                stage1.get("early_stopping_patience", 7)
+            ),
+            stage1_warmup_epochs=int(stage1.get("warmup_epochs", 3)),
+            stage1_backbone_learning_rate=float(
+                stage1.get("backbone_learning_rate", 1e-5)
+            ),
+            stage1_auxiliary_learning_rate=float(
+                stage1.get("auxiliary_learning_rate", 1e-4)
+            ),
+            stage1_warmup_initial_learning_rate=float(
+                stage1.get("warmup_initial_learning_rate", 1e-6)
+            ),
+            stage1_pretrained_backbone_checkpoint=(
+                args.stage1_pretrained_backbone_checkpoint
+            ),
             pretrained_stage2=bool(stage2.get("pretrained_backbone", False)),
             stage1_feature_mode=str(stage1.get("feature_mode", "rgb_fft")),
             stage1_focal_gamma=float(stage1.get("focal_gamma", 2.0)),
+            stage1_frame_classification_weight=float(
+                stage1.get("frame_classification_weight", 0.25)
+            ),
+            stage1_smoothing_weight=float(stage1.get("smoothing_weight", 0.05)),
+            stage1_smoothing_truncation=float(stage1.get("smoothing_truncation", 4.0)),
+            stage1_explainability_weight=float(
+                stage1.get("explainability_weight", 0.05)
+            ),
+            stage1_mask_regularization_weight=float(
+                stage1.get("mask_regularization_weight", 0.02)
+            ),
+            stage1_mask_sparsity_weight=float(
+                stage1.get("mask_sparsity_weight", 1e-3)
+            ),
+            stage1_motion_iterations=int(stage1.get("motion_iterations", 3)),
+            stage1_correlation_radius=int(stage1.get("correlation_radius", 2)),
             stage1_augmentation=bool(stage1.get("augmentation", True)),
             stage1_tta_slots=int(stage1.get("inference_tta_slots", 3)),
             stage1_size=int(stage1.get("size", 224)),
             stage1_frames=int(stage1.get("frames", 16)),
             stage1_batch_size=int(stage1.get("batch_size", 1)),
+            stage1_train_slots=int(stage1.get("train_slots", 3)),
+            stage1_jitter_frames=int(stage1.get("jitter_frames", 4)),
+            stage1_random_temporal_jitter=bool(stage1.get("random_temporal_jitter", True)),
+            stage1_forensic_size=int(stage1.get("forensic_size", 320)),
+            stage1_fft_size=int(stage1.get("fft_size", 112)),
+            stage1_row_profile_bins=int(stage1.get("row_profile_bins", 16)),
+            stage1_num_workers=int(stage1.get("num_workers", 0)),
             training_control=control,
             processed_root=processed_root,
         )

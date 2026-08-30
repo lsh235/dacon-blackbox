@@ -19,11 +19,34 @@ training:
   log_dir: ../logs
 
 stage1:
+  epochs: 30
+  minimum_epochs: 10
+  early_stopping_patience: 7
+  warmup_epochs: 3
+  warmup_initial_learning_rate: 0.000001
+  backbone_learning_rate: 0.00001
+  auxiliary_learning_rate: 0.0001
   feature_mode: rgb_fft
   focal_gamma: 2.0
+  frame_classification_weight: 0.25
+  smoothing_weight: 0.05
+  smoothing_truncation: 4.0
+  explainability_weight: 0.05
+  mask_regularization_weight: 0.02
+  mask_sparsity_weight: 0.001
+  motion_iterations: 3
+  correlation_radius: 2
   size: 224
   frames: 16
+  training_sequence_lengths: [16, 24, 32]
   batch_size: 1
+  train_slots: 3
+  jitter_frames: 4
+  random_temporal_jitter: true
+  forensic_size: 320
+  fft_size: 112
+  row_profile_bins: 16
+  num_workers: 0
   augmentation: true
   inference_tta_slots: 3
 
@@ -60,7 +83,10 @@ stage3:
   physics_projection_dim: 32
 
 preprocessing:
-  stage1_slots: 1
+  stage1_frames: 32
+  stage1_slots: 3
+  stage1_jitter_frames: 4
+  stage1_forensic_size: 320
   max_windows_per_video: null
 
 inference:

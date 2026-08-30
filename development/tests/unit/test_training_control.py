@@ -40,6 +40,8 @@ class TrainingControlTests(unittest.TestCase):
                 valid_metric=None,
                 monitor_name="train_loss_proxy_no_validation",
                 monitor_value=1.0,
+                valid_loss=1.2,
+                diagnostics={"prediction_change_rate": 0.0},
             )
             (parameter.square()).backward()
             optimizer.step()
@@ -47,6 +49,8 @@ class TrainingControlTests(unittest.TestCase):
             history = [json.loads(line) for line in logger.path.read_text().splitlines()]
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["valid_metric"], None)
+        self.assertEqual(history[0]["valid_loss"], 1.2)
+        self.assertEqual(history[0]["prediction_change_rate"], 0.0)
         self.assertLess(optimizer.param_groups[0]["lr"], 0.1)
         self.assertFalse(stopper.step(1.0))
         self.assertFalse(stopper.step(1.0))
