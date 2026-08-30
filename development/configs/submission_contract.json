@@ -39,7 +39,11 @@
     "required_files": [
       "inference.py",
       "requirements.txt",
-      "model/stage1/best.pt",
+      "model/stage1/fold_0/best.pt",
+      "model/stage1/fold_1/best.pt",
+      "model/stage1/fold_2/best.pt",
+      "model/stage1/fold_3/best.pt",
+      "model/stage1/fold_4/best.pt",
       "model/stage2/best.pt",
       "model/stage2/resnet18-f37072fd.pth",
       "model/stage3/best.pt"

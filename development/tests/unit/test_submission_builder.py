@@ -44,7 +44,6 @@ class SubmissionBuilderTests(unittest.TestCase):
 
             model_root = root / "models"
             for relative in (
-                "stage1/best.pt",
                 "stage2/best.pt",
                 "stage2/resnet18-f37072fd.pth",
                 "stage3/best.pt",
@@ -52,6 +51,11 @@ class SubmissionBuilderTests(unittest.TestCase):
                 path = model_root / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"test-model")
+            stage1_checkpoint_dir = root / "stage1-folds"
+            for fold_index in range(5):
+                path = stage1_checkpoint_dir / f"fold_{fold_index}" / "model" / "best.pt"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"test-mode-g-model")
             source_root = root / "src"
             package = source_root / "blackbox"
             package.mkdir(parents=True)
@@ -60,6 +64,7 @@ class SubmissionBuilderTests(unittest.TestCase):
             requirements.write_text("torch==2.8.0\n", encoding="utf-8")
             entrypoint = root / "inference.py"
             entrypoint.write_text(
+                "# __BLACKBOX_EMBEDDED_RUNTIME__\n"
                 "def predict_stage1(data_dir, model_dir): pass\n"
                 "def predict_stage2(data_dir, model_dir): pass\n"
                 "def predict_stage3(data_dir, model_dir): pass\n",
@@ -68,6 +73,7 @@ class SubmissionBuilderTests(unittest.TestCase):
             report = build_submission_package(
                 input_dir=input_dir,
                 model_root=model_root,
+                stage1_checkpoint_dir=stage1_checkpoint_dir,
                 output_dir=root / "output",
                 source_root=source_root,
                 requirements=requirements,
@@ -80,9 +86,21 @@ class SubmissionBuilderTests(unittest.TestCase):
             self.assertEqual(report.combined_rows, 3)
             with ZipFile(report.archive) as archive:
                 names = set(archive.namelist())
+                inference_source = archive.read("inference.py").decode("utf-8")
             self.assertTrue(REQUIRED_FILES.issubset(names))
-            self.assertIn("submission.csv", names)
-            self.assertIn("blackbox/__init__.py", names)
+            self.assertNotIn("submission.csv", names)
+            self.assertNotIn("blackbox/__init__.py", names)
+            self.assertNotIn("model/runtime.zip", names)
+            self.assertNotIn("__BLACKBOX_EMBEDDED_RUNTIME__", inference_source)
+            self.assertIn("_EmbeddedBlackboxLoader", inference_source)
+            self.assertEqual(
+                {Path(name).parts[0] for name in names},
+                {"model", "inference.py", "requirements.txt"},
+            )
+            self.assertEqual(
+                {Path(name).parts[1] for name in names if name.startswith("model/")},
+                {"stage1", "stage2", "stage3"},
+            )
 
 
 if __name__ == "__main__":

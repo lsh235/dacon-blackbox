@@ -24,6 +24,7 @@ from blackbox.common.runtime import (
     load_checkpoint,
     release_device_cache,
 )
+from blackbox.contracts import validate_prediction_frame
 from blackbox.stages.stage1.baseline import (
     DEFAULT_BASE_INITIALIZATION_SEED,
     DEFAULT_CORRELATION_RADIUS,
@@ -450,6 +451,31 @@ def predict_mode_g_ensemble(
         fold_probabilities=tuple(fold_probabilities),
         ensemble_probabilities=ensemble,
     )
+
+
+def predict_stage1(data_dir, model_dir):
+    """Competition entrypoint for the five-fold detached Mode G ensemble."""
+
+    result = predict_mode_g_ensemble(
+        data_dir,
+        model_dir,
+        batch_size=1,
+        num_workers=2,
+        require_cuda=True,
+        use_amp=True,
+    )
+    frame = pd.DataFrame(
+        {
+            "ID": [path.stem for path in result.videos],
+            "answer": np.where(
+                result.ensemble_probabilities[:, 1] >= 0.5,
+                CLASS_NAMES[1],
+                CLASS_NAMES[0],
+            ),
+        },
+        columns=["ID", "answer"],
+    )
+    return validate_prediction_frame("stage1", frame)
 
 
 def format_stage1_submission(

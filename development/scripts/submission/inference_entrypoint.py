@@ -1,5 +1,7 @@
 """Top-level DACON inference entrypoints packaged by ``build_submission.sh``."""
 
+# __BLACKBOX_EMBEDDED_RUNTIME__
+
 from blackbox.inference import (
     predict_stage1 as _predict_stage1,
     predict_stage2 as _predict_stage2,

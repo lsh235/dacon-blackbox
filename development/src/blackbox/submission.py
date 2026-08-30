@@ -19,7 +19,11 @@ REQUIRED_FUNCTIONS = {"predict_stage1", "predict_stage2", "predict_stage3"}
 REQUIRED_FILES = {
     "inference.py",
     "requirements.txt",
-    "model/stage1/best.pt",
+    "model/stage1/fold_0/best.pt",
+    "model/stage1/fold_1/best.pt",
+    "model/stage1/fold_2/best.pt",
+    "model/stage1/fold_3/best.pt",
+    "model/stage1/fold_4/best.pt",
     "model/stage2/best.pt",
     "model/stage2/resnet18-f37072fd.pth",
     "model/stage3/best.pt",
@@ -72,6 +76,17 @@ def validate_submission_zip(path: str | Path) -> SubmissionReport:
                 pure = PurePosixPath(name)
                 if name.startswith("/") or "\\" in name or ".." in pure.parts:
                     raise SubmissionValidationError(f"unsafe archive path: {name!r}")
+                if pure.parts[0] not in {"model", "inference.py", "requirements.txt"}:
+                    raise SubmissionValidationError(
+                        f"unexpected top-level submission entry: {name!r}"
+                    )
+                if pure.parts[0] == "model" and (
+                    len(pure.parts) < 3
+                    or pure.parts[1] not in {"stage1", "stage2", "stage3"}
+                ):
+                    raise SubmissionValidationError(
+                        f"unexpected model submission entry: {name!r}"
+                    )
 
             missing = sorted(REQUIRED_FILES - set(names))
             if missing:

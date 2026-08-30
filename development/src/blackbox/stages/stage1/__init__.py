@@ -1,7 +1,8 @@
 """Stage 1 training and inference API within the stage-specific package."""
 
-from .baseline import Stage1MViT, fit_stage1, predict_stage1, score_stage1_videos
+from .baseline import Stage1MViT, fit_stage1, score_stage1_videos
 from .dataset import RGB_FEATURES, RGB_FFT_FEATURES
+from .inference_stage1 import predict_stage1
 from .losses import (
     FocalLoss,
     Stage1MultiTaskLoss,

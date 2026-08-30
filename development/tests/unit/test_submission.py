@@ -63,6 +63,24 @@ class SubmissionValidationTests(unittest.TestCase):
             with self.assertRaisesRegex(SubmissionValidationError, "unsafe archive path"):
                 validate_submission_zip(path)
 
+    def test_rejects_unexpected_top_level_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "submit.zip"
+            _write_submission(path)
+            with ZipFile(path, "a") as archive:
+                archive.writestr("blackbox/__init__.py", "")
+            with self.assertRaisesRegex(SubmissionValidationError, "unexpected top-level"):
+                validate_submission_zip(path)
+
+    def test_rejects_file_directly_below_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "submit.zip"
+            _write_submission(path)
+            with ZipFile(path, "a") as archive:
+                archive.writestr("model/runtime.zip", "not permitted")
+            with self.assertRaisesRegex(SubmissionValidationError, "unexpected model"):
+                validate_submission_zip(path)
+
 
 if __name__ == "__main__":
     unittest.main()
