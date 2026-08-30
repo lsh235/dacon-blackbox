@@ -1,119 +1,94 @@
-# DACON 코드 제출 대회 가이드
+# 3. 코드 제출 대회 가이드
 
-## 1. 대회 방식 소개
-
-### 1.1 왜 코드 제출 방식인가요?
-* **공정한 모델 평가 보장**: 평가 데이터(X)를 참가자에게 공개하지 않고 서버 환경에서 직접 실행하므로 치팅이 불가능하며, 데이터에 특화된 편법이나 과적합 문제를 근본적으로 해결합니다.
-* **실무 환경을 고려한 종합 평가**: 정확도뿐만 아니라 추론 속도, 메모리 효율성, 안정성 등 다면적 성능을 종합 평가하여 실제 배포 환경과 유사한 조건에서 성능을 검증합니다.
-* **즉시 활용 가능한 실행 모델 확보**: 검증된 추론 파이프라인을 갖춘 완성된 모델을 확보하여 개발부터 배포까지의 시간과 비용을 절감합니다.
-
-### 1.2 대회 진행 과정
-1. **참가자 로컬 환경**: 데이터 학습 $\rightarrow$ 모델 가중치 생성(예: `model.pt`) $\rightarrow$ 추론 코드 작성 및 테스트
-2. **평가 서버 환경**: 참가자 제출 코드 실행 $\rightarrow$ 실제 평가 데이터 예측 $\rightarrow$ 최종 점수 산출
-
-### 1.3 평가 데이터 구성
-* **샘플 평가 데이터 (참가자 제공)**: 실제 평가 데이터와 동일한 폴더 구조 및 형식을 가진 소량의 더미 데이터로, 로컬 테스트용입니다.
-* **실제 평가 데이터 (서버 자동 적용)**: 실제 평가 시 사용되는 전체 데이터셋입니다.
+본 대회는 `submit.zip` 파일을 제출하는 방식의 **'코드 제출 대회'**로 진행됩니다. (기본 가이드 문서 참고)
 
 ---
 
-## 2. 제출 파일 구성
-
-제출은 ZIP 파일 형식(`your_submission.zip`)으로 이루어지며, 아래의 **필수 디렉터리 구조**를 엄격히 준수해야 합니다 (파일명 공백 및 한글 제외).
+## 📁 제출 파일 구조 (`submit.zip`)
+참가자는 아래와 같은 구조로 `submit.zip`을 구성하여 제출해야 합니다. 
+**디렉토리 명과 파일 명을 모두 정확히 일치시켜야 합니다.** (추가 최상위 폴더가 존재 등 구조가 불일치하는 경우 설치 오류가 발생합니다.)
 
 ```text
-your_submission.zip
-├── model/                 # 학습된 모델 가중치 저장 디렉터리 (파일명 자유)
-│   └── model.pt
-├── script.py              # 추론 실행 코드 (반드시 이 파일명 사용)
-└── requirements.txt       # 패키지(라이브러리) 의존성 명시
+submit.zip
+├── model/
+│   ├── stage1/
+│   ├── stage2/
+│   └── stage3/
+├── inference.py         # 반드시 포함
+└── requirements.txt
 ```
 
-* **`model/`**: 로컬에서 훈련한 모델 가중치 파일(예: `model.pt`, `tokenizer.json` 등)을 자유롭게 저장합니다.
-* **`script.py`**: 서버에서 자동 실행되는 추론 전용 코드입니다. **학습 과정을 포함해선 안 되며**, `데이터 로드 → 모델 로드 → 예측 → 결과 저장` 순서로 작성합니다.
-* **`requirements.txt`**: 추가 패키지 설치용 (`pip install -r requirements.txt`). 서버에 이미 설치된 기본 패키지는 버전 충돌 방지를 위해 가급적 제외를 권장합니다.
+* **`script.py`**: `submit.zip` 제출 시 평가 서버에서 자동으로 실행됩니다.
+* **`requirements.txt`**: `pip install -r requirements.txt` 명령어로 설치 가능한 형태여야 하며, 추론 시 필요한 모든 패키지를 포함해야 합니다.
+* **`inference.py`**: **반드시 포함**해야 하며(미포함 시 제출 횟수 차감), 다음 세 개의 함수를 모두 구현해야 합니다.
 
----
-
-## 3. 평가 서버 동작 과정
-
-1. **환경 구성**: 서버에서 `data/`와 `output/` 폴더를 자동으로 추가하여 실행 환경을 세팅합니다.
-2. **패키지 설치**: `requirements.txt` 설치 진행. (설치 실패 시 **설치 오류** 처리, 제출 횟수 미차감)
-3. **추론 실행**: `python script.py` 실행. (실행 실패 또는 시간 초과 시 **제출 오류** 처리, 제출 횟수 차감)
-4. **결과 확인**: `output/submission.csv` 생성 여부 및 내용 검증.
-
-*(서버 하드웨어 사양 및 기본 설치 패키지는 각 대회 페이지 '평가' 탭에서 확인)*
-
----
-
-## 4. 추론 코드 작성 가이드
-
-### 권장 코드 구조 (`script.py`)
 ```python
-import os
-import pandas as pd
+def predict_stage1(data_dir, model_dir):
+    pass
 
-def load_model():
-    # model/ 디렉터리에서 로컬 모델 가중치 로드
-    model_path = os.path.join('model', 'your_model.pt')
-    return model
+def predict_stage2(data_dir, model_dir):
+    pass
 
-def load_data():
-    # data/ 디렉터리에서 평가 데이터 로드
-    data_path = os.path.join('data', 'test.csv')
-    return data
-
-def predict(model, data):
-    # 추론 수행
-    predictions = model.predict(data)
-    return predictions
-
-def save_results(predictions):
-    # output/submission.csv로 결과 저장 (필수)
-    os.makedirs('output', exist_ok=True)
-    submission = pd.DataFrame({'prediction': predictions})
-    submission.to_csv('output/submission.csv', index=False)
-
-if __name__ == "__main__":
-    model = load_model()
-    data = load_data()
-    predictions = predict(model, data)
-    save_results(predictions)
+def predict_stage3(data_dir, model_dir):
+    pass
 ```
 
-### ⚠️ 오프라인 환경 제약사항 (중요)
-서버는 패키지 설치 이후 **완전한 오프라인 환경**으로 동작합니다.
-* **불가능한 작업**: `model.from_pretrained()` 등을 통한 온라인 다운로드, 외부 API(OpenAI 등) 호출, 인터넷 연결.
-* **올바른 접근**: 필요한 모든 파일(모델, 토크나이저 등)을 `model/`에 미리 담아 로컬 파일 경로로 접근해야 합니다.
-  * ❌ 잘못된 예시: `AutoModel.from_pretrained("bert-base-uncased")`
-  * ✅ 올바른 예시: `AutoModel.from_pretrained(os.path.join('model', 'bert-base-uncased'))`
+각 함수는 다음 컬럼을 포함한 `pandas.DataFrame`을 반환해야 합니다.
+
+### 📊 출력값 컬럼
+| 구분 | 출력 컬럼 |
+| :--- | :--- |
+| **Stage 1** | `ID`, `answer` |
+| **Stage 2** | `ID`, `collision_frame`, `entry_frame`, `evasion_space`, `entry_side` |
+| **Stage 3** | `ID`, `sample_index`, `accel_label`, `steer_label` |
 
 ---
 
-## 5. 제출 오류 유형 및 해결방법
+## ⚙️ 평가 서버에서 추가되는 항목
+제출 시, 평가 서버에서 참가자가 제출한 `submit.zip` 파일에는 아래 항목이 **자동으로 추가**됩니다.
 
-| 오류 유형 | 발생 원인 | 해결 방법 | 제출 횟수 |
-| :--- | :--- | :--- | :--- |
-| **설치 오류** | 파일 구조 불일치, 패키지 설치 실패 및 시간 초과 | 구조 및 버전 재확인, 불필요 패키지 제거 | 차감 안 됨 |
-| **제출 오류** | `script.py` 실행 에러, `submission.csv` 미생성, 추론 시간 초과 | 로컬 철저 테스트, 예외 처리, 알고리즘 최적화 | **차감됨** |
+```text
+submit.zip (평가 서버 실행 시 예시)
+├── model/               # 참가자 구성
+├── inference.py         # 참가자 구성
+├── requirements.txt     # 참가자 구성
+├── data/                # 평가에 사용될 테스트 데이터 (자동 생성, 읽기 전용)
+├── script.py            # 채점용 스크립트 (자동 생성)
+└── output/              # 참가자 추론 결과 저장 경로 (자동 생성)
+    └── submission.csv   # 반드시 생성되어야 하는 예측 결과 파일
+```
+
+* **`data/`**: 실제 평가 데이터를 포함한 경진대회 데이터로, 쓰기 및 수정이 불가능한 **읽기 전용** 디렉토리입니다.
+* **`output/`**: 참가자의 `script.py` 실행 결과로 생성된 예측 결과 파일이 저장되는 디렉토리이며, 해당 경로 내에 반드시 `submission.csv` 형태로 저장되어야 합니다.
+
+> ⚠️ **주의사항 (오프라인 환경)**
+> 평가 환경은 추론 단계에서 인터넷이 차단되어 외부 다운로드가 실패합니다. 
+> 추론 코드에서는 사전학습 가중치를 내려받지 않도록 `weights=None` (구버전 표기: `pretrained=False`)으로 모델 구조만 만든 뒤, 제출하신 체크포인트를 `load_state_dict`로 불러와야 합니다.
 
 ---
 
-## 6. 제출 전 최종 점검
-* [ ] 최상위 경로에 `model/`, `script.py`, `requirements.txt`가 존재하는가?
-* [ ] `script.py`가 로컬에서 정상 실행되며 `output/submission.csv`를 생성하는가?
-* [ ] 모델 파라미터 로딩 등 코드 내 모든 경로가 **상대 경로**로 설정되었으며 **오프라인 동작**이 가능한가?
-* [ ] `requirements.txt`에 꼭 필요한 패키지만 명시되었는가?
+## 💾 제한 사항 및 서버 사양
+
+### 1. 용량 제한
+* **제출 파일(zip) 용량 제한**: 최대 10GB
+* **압축 해제 후 용량**: 최대 32GB
+
+### 2. ⏱️ 실행 시간 제한
+* **패키지 설치 시간**: 최대 10분 (시간 초과 시 '설치 오류', 횟수 미차감)
+* **추론 코드 실행 시간**: 최대 60분 (시간 초과 시 '제출 오류', 횟수 차감)
+  * *※ 전체 추론 실행시간은 Stage 1·2·3의 데이터 로딩, 전처리, 모델 추론, 후처리 및 예측파일 저장시간을 모두 포함합니다.*
+
+### 3. 평가 서버 사양
+* **GPU**: NVIDIA L40S
+* **GPU VRAM**: 44.7GiB
+* **CPU**: 7 vCPU
+* **CPU RAM**: 60GB
+* **인터넷 접속**: ❌ 비활성화 (패키지 설치 이후 외부 서버 연결 및 파일 다운로드 절대 불가)
 
 ---
 
-## 7. 성공적인 제출을 위한 팁
-* **로컬 테스트 구축**: 샘플 데이터(더미 파일)를 활용하여 충분히 추론 코드를 테스트하세요.
-* **오프라인 철저 대비**: 필요한 모델 파일을 빠짐없이 다운로드하여 ZIP에 포함시키세요.
-* **예외 처리 & 최적화**: 다양한 오류에 대비한 예외 처리 코드를 넣고, 시간 제한에 맞춰 추론 속도를 최적화하세요.
+## 📦 평가 서버 기본 설치 패키지(라이브러리) 안내
+아래의 패키지는 평가 서버에 기본적으로 설치되어 있습니다. 버전이 명시된 패키지에 한해 다른 버전을 사용할 경우 설치 에러가 발생할 수 있습니다. 
+가급적 **평가 서버에 기본 설치된 패키지를 활용**하고, 제출하는 `requirements.txt`에는 포함하지 않는 것을 권장합니다.
 
----
-
-## 8. 문의사항
-* **이메일**: dacon@dacon.io
-* **토크 탭**: 대회 페이지 내 토크(Talk) 탭
+*(참고: 라이브러리 설치 에러가 발생하면 '설치 오류'에 해당하며, 일일 제출 횟수에는 반영되지 않습니다.)*
